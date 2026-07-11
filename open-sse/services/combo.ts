@@ -24,6 +24,7 @@ import {
   errorResponseWithComboDiagnostics,
 } from "../utils/error.ts";
 import type { ComboDiagnostics } from "../utils/error.ts";
+import { log } from "../utils/logger.ts";
 import { buildTargetTimeoutRunner } from "./combo/targetTimeoutRunner.ts";
 import { recordComboRequest, recordComboShadowRequest, getComboMetrics } from "./comboMetrics.ts";
 import {
