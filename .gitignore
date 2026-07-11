@@ -234,3 +234,7 @@ omniroute.md
 mise.toml
 _artifacts/
 .claude-flow/
+
+# build/diagnostic logs from local Docker experiments
+.build-*.log
+.docker-*.log

@@ -805,7 +805,19 @@ test("isDailyQuotaExhausted detects today's quota errors", () => {
   assert.equal(isDailyQuotaExhausted("You have exceeded today's quota for model X"), true);
   assert.equal(isDailyQuotaExhausted("exceeded your daily quota"), true);
   assert.equal(isDailyQuotaExhausted("Please try again tomorrow"), true);
+  // Cloudflare Workers AI free-tier daily neuron cap — the canonical
+  // Cloudflare phrasing is "you have used up your daily free allocation
+  // of N neurons". Without this match, Cloudflare accounts fall through
+  // to the generic RATE_LIMITED path and get hammered forever.
+  assert.equal(
+    isDailyQuotaExhausted("AiError: you have used up your daily free allocation of 10,000 neurons"),
+    true
+  );
+  assert.equal(isDailyQuotaExhausted("You have exceeded your daily request limit"), true);
+  assert.equal(isDailyQuotaExhausted("Daily allowance exhausted for this account"), true);
+  // Negative cases
   assert.equal(isDailyQuotaExhausted("rate limit exceeded"), false);
+  assert.equal(isDailyQuotaExhausted("You have exceeded your current quota"), false);
   assert.equal(isDailyQuotaExhausted(""), false);
   assert.equal(isDailyQuotaExhausted(null), false);
 });
@@ -815,6 +827,29 @@ test("getMsUntilTomorrow returns positive value less than 24 hours", () => {
   const ms = getMsUntilTomorrow();
   assert.ok(ms > 0, "should be positive");
   assert.ok(ms <= 24 * 60 * 60 * 1000, "should be <= 24 hours");
+});
+
+test("getMsUntilTomorrow targets UTC midnight, not local midnight", () => {
+  // The cooldown should target UTC 00:00 because most providers (Cloudflare,
+  // OpenAI, Anthropic, Google) reset their daily quotas at UTC midnight,
+  // regardless of where the OmniRoute server is hosted.
+  const now = new Date();
+  const ms = accountFallback.getMsUntilTomorrow();
+  const targetMs =
+    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 0, 0, 0) -
+    now.getTime();
+  // Allow up to 1s of clock skew between the two computations.
+  assert.ok(
+    Math.abs(ms - targetMs) < 1000,
+    `expected ~${targetMs}ms until UTC midnight, got ${ms}ms`
+  );
+});
+
+test("DAILY_QUOTA_COOLDOWN_CAP_MS is 16 hours", () => {
+  // The cap ensures an account hit early in the UTC day still recovers
+  // within a reasonable window — at 02:00 UTC, msUntilTomorrow would
+  // otherwise be 22h.
+  assert.equal(accountFallback.DAILY_QUOTA_COOLDOWN_CAP_MS, 16 * 60 * 60 * 1000);
 });
 
 test("checkFallbackError locks model until tomorrow for non-429 daily quota exhaustion", () => {
@@ -827,9 +862,20 @@ test("checkFallbackError locks model until tomorrow for non-429 daily quota exha
   assert.equal(result.dailyQuotaExhausted, true);
   assert.ok(result.cooldownMs > 0, "cooldown should be positive");
   assert.ok(result.cooldownMs <= 24 * 60 * 60 * 1000, "cooldown should be <= 24 hours");
+  // And the new 16h cap should be respected even if tomorrow is far away.
+  assert.ok(
+    result.cooldownMs <= accountFallback.DAILY_QUOTA_COOLDOWN_CAP_MS,
+    `cooldown ${result.cooldownMs}ms exceeds 16h cap`
+  );
 });
 
-test("checkFallbackError routes API-key 429 'try again tomorrow' through resilience cooldown", () => {
+// --- Bug fix: API-key 429 with daily-quota body text used to fall through
+// to the generic RATE_LIMITED path (5s base, escalating), causing the
+// account to be hammered repeatedly until backoffLevel maxed out. The fix
+// detects daily quota from body text regardless of provider category, and
+// applies a UTC-midnight-aligned cooldown capped at 16h.
+
+test("checkFallbackError recognizes API-key 429 'try again tomorrow' as daily quota", () => {
   const result = checkFallbackError(
     429,
     "Please try again tomorrow",
@@ -840,11 +886,13 @@ test("checkFallbackError routes API-key 429 'try again tomorrow' through resilie
     makeProfile()
   );
   assert.equal(result.shouldFallback, true);
-  assert.equal(result.dailyQuotaExhausted, undefined);
-  assert.equal(result.cooldownMs, 125);
+  assert.equal(result.reason, RateLimitReason.QUOTA_EXHAUSTED);
+  assert.equal(result.dailyQuotaExhausted, true);
+  assert.ok(result.cooldownMs > 0);
+  assert.ok(result.cooldownMs <= accountFallback.DAILY_QUOTA_COOLDOWN_CAP_MS);
 });
 
-test("checkFallbackError routes API-key 429 'daily quota' text through resilience cooldown", () => {
+test("checkFallbackError recognizes API-key 429 'daily quota' text as daily quota", () => {
   const result = checkFallbackError(
     429,
     "You have exceeded your daily quota",
@@ -855,8 +903,40 @@ test("checkFallbackError routes API-key 429 'daily quota' text through resilienc
     makeProfile()
   );
   assert.equal(result.shouldFallback, true);
-  assert.equal(result.dailyQuotaExhausted, undefined);
-  assert.equal(result.cooldownMs, 125);
+  assert.equal(result.reason, RateLimitReason.QUOTA_EXHAUSTED);
+  assert.equal(result.dailyQuotaExhausted, true);
+  assert.ok(result.cooldownMs > 0);
+  assert.ok(result.cooldownMs <= accountFallback.DAILY_QUOTA_COOLDOWN_CAP_MS);
+});
+
+test("checkFallbackError recognizes Cloudflare 'daily free allocation' on 429 as daily quota", () => {
+  // Regression: the actual Cloudflare Workers AI body for daily-quota
+  // exhaustion is "AiError: you have used up your daily free allocation
+  // of N neurons" — phrased differently from the patterns the original
+  // detector matched. Without this match, every Cloudflare account hit
+  // its daily cap would fall through to the generic RATE_LIMITED path
+  // and get hammered forever.
+  const result = checkFallbackError(
+    429,
+    '{"errors":[{"message":"AiError: AiError: you have used up your daily free allocation of 10,000 neurons"}],"success":false}',
+    0,
+    null,
+    "cloudflare-ai",
+    null,
+    makeProfile()
+  );
+  assert.equal(result.shouldFallback, true);
+  assert.equal(result.reason, RateLimitReason.QUOTA_EXHAUSTED);
+  assert.equal(result.dailyQuotaExhausted, true);
+  assert.ok(result.cooldownMs > 0);
+  // 16h cap, never more — even at 02:00 UTC where msUntilTomorrow is 22h.
+  assert.ok(
+    result.cooldownMs <= accountFallback.DAILY_QUOTA_COOLDOWN_CAP_MS,
+    `cooldown ${result.cooldownMs}ms exceeds 16h cap`
+  );
+  // Sanity: cooldown should be at least 1 minute (a quota cooldown
+  // shorter than a minute is clearly a misclassification).
+  assert.ok(result.cooldownMs >= 60 * 1000);
 });
 
 test("checkFallbackError preserves OAuth 429 daily quota semantics", () => {
@@ -874,6 +954,25 @@ test("checkFallbackError preserves OAuth 429 daily quota semantics", () => {
   assert.equal(result.reason, RateLimitReason.QUOTA_EXHAUSTED);
   assert.equal(result.dailyQuotaExhausted, true);
   assert.ok(result.cooldownMs > 0);
+});
+
+test("checkFallbackError still routes plain 429 (no daily-quota body) through resilience cooldown", () => {
+  // Negative case: ensure we didn't over-correct — a plain 429 with no
+  // daily-quota body text should still go through the normal RATE_LIMITED
+  // backoff path, NOT the daily-quota 16h cooldown.
+  const result = checkFallbackError(
+    429,
+    "Too many requests",
+    0,
+    null,
+    "openai",
+    null,
+    makeProfile()
+  );
+  assert.equal(result.shouldFallback, true);
+  assert.notEqual(result.dailyQuotaExhausted, true);
+  // baseCooldownMs=100, backoff level 0 → 125ms scaled cooldown
+  assert.equal(result.cooldownMs, 125);
 });
 
 // ModelScope daily quota lockout tests (commit 0456a1f5)
@@ -895,13 +994,15 @@ test("recordModelLockoutFailure sets cooldown until tomorrow 0:00 for quota_exha
 
     const profile = makeProfile();
 
-    // Calculate milliseconds until tomorrow 00:00 local time
+    // Calculate milliseconds until tomorrow 00:00 UTC — the daily-quota
+    // lockout aligns to UTC midnight because most providers (Cloudflare,
+    // OpenAI, Anthropic, Google, ModelScope) reset at UTC 00:00 regardless
+    // of where the OmniRoute server is hosted.
     const tomorrow = new Date(now);
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    tomorrow.setHours(0, 0, 0, 0);
+    tomorrow.setUTCHours(24, 0, 0, 0);
     const expectedMsUntilTomorrow = tomorrow.getTime() - now;
 
-    // Account for timezone offset: function uses local time, test env may use UTC
+    // Account for timezone offset: function uses UTC, test env may use local
     const timezoneOffset = new Date().getTimezoneOffset() * 60 * 1000;
 
     // Record failure with quota_exhausted reason
@@ -924,7 +1025,7 @@ test("recordModelLockoutFailure sets cooldown until tomorrow 0:00 for quota_exha
     // Allow ±5 minutes tolerance (300,000 ms)
     assert.ok(
       diff <= 300_000,
-      `cooldown should be ms until tomorrow 0:00 (expected ${expectedMsUntilTomorrow}ms, got ${result.cooldownMs}ms, diff ${diff}ms)`
+      `cooldown should be ms until tomorrow 0:00 UTC (expected ${expectedMsUntilTomorrow}ms, got ${result.cooldownMs}ms, diff ${diff}ms)`
     );
 
     // Verify model is locked
@@ -1299,14 +1400,15 @@ test("Gemini RPD (quota_exhausted) still triggers midnight lockout in recordMode
       profile
     );
 
-    // Must lock until midnight, NOT exponential backoff
+    // Must lock until UTC midnight, NOT exponential backoff. The cooldown
+    // aligns to UTC 00:00 because Gemini's RPD resets at UTC midnight,
+    // regardless of where the OmniRoute server is hosted.
     const tomorrow = new Date(now);
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    tomorrow.setHours(0, 0, 0, 0);
+    tomorrow.setUTCHours(24, 0, 0, 0);
     const expected = tomorrow.getTime() - now;
     assert.ok(
       Math.abs(result.cooldownMs - expected) <= 300_000,
-      `cooldown should be until tomorrow (expected ~${expected}, got ${result.cooldownMs})`
+      `cooldown should be until tomorrow UTC (expected ~${expected}, got ${result.cooldownMs})`
     );
     clearModelLock(provider, connectionId, model);
   } finally {

@@ -1,0 +1,59 @@
+FROM node:24-trixie-slim
+
+# System packages (better-sqlite3 needs glibc, ca-certificates for HTTPS APIs)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy just the package files first for better layer caching
+COPY package.json package-lock.json ./
+COPY open-sse/package.json ./open-sse/
+
+# Install all production deps. This layer brings in next, better-sqlite3, etc.
+RUN npm ci --omit=dev --no-audit --no-fund --ignore-scripts --legacy-peer-deps
+
+# Copy the pre-built standalone bundle (built locally with `npm run build:release`).
+# This is self-contained: dev/run-standalone.mjs, open-sse/*, src/*, etc. are all inside.
+COPY .build/next/standalone ./
+COPY dist ./dist
+
+# Copy the healthcheck script (not traced by Next standalone output) — sourced from dist/
+# Note: dist/ also has peer-stamp.mjs, http-method-guard.cjs, etc.
+# healthcheck.mjs needs to be at /app for the original Dockerfile's HEALTHCHECK CMD,
+# but we disable the healthcheck anyway (HEALTHCHECK NONE below) and use our own
+# systemd timer watchdog. Keep it copied just in case.
+COPY scripts/dev/healthcheck.mjs ./healthcheck.mjs
+COPY scripts/dev/head-response-guard.cjs ./head-response-guard.cjs
+COPY scripts/dev/http-method-guard.cjs ./http-method-guard.cjs
+
+# Runtime configuration
+ENV NODE_ENV=production
+ENV PORT=20128
+ENV HOSTNAME=0.0.0.0
+ENV DATA_DIR=/app/data
+ENV OMNIROUTE_MIGRATIONS_DIR=/app/migrations
+ENV OMNIROUTE_MEMORY_MB=1024
+ENV NODE_OPTIONS="--max-old-space-size=${OMNIROUTE_MEMORY_MB}"
+
+# Create non-root user (UID 1000, matches the standard image)
+RUN groupadd -f -r node && useradd -M -r -g node -d /app -s /usr/sbin/nologin node || true
+
+# Create data dir (writable by node user)
+RUN mkdir -p /app/data && chown -R node:node /app
+
+# Disable the built-in Next.js healthcheck — we run our own watchdog via systemd
+# timer (see /etc/systemd/system/keep-omniroute-alive.timer). The baked-in
+# healthcheck probes /api/monitoring/health which can transiently fail during
+# normal startup, causing Docker to kill the container with SIGKILL.
+HEALTHCHECK NONE
+
+USER node
+
+EXPOSE 20128 20129 20133
+
+# Default cmd: run standalone via the WS-aware wrapper which installs the
+# trusted peer-IP stamp. dev/run-standalone.mjs selects server-ws.mjs if present,
+# else server.js (CLI fallback).
+CMD ["node", "dev/run-standalone.mjs"]

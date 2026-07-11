@@ -9,6 +9,7 @@ import {
   isValidApiKey,
   extractSessionAffinityKey,
 } from "../services/auth";
+import { markFromDailyQuota } from "../services/inMemoryAccountLock";
 import {
   getRuntimeProviderProfile,
   shouldMarkAccountExhaustedFrom429,
@@ -16,6 +17,8 @@ import {
   lockModel,
   recordModelLockoutFailure,
   isDailyQuotaExhausted,
+  getMsUntilTomorrow,
+  DAILY_QUOTA_COOLDOWN_CAP_MS,
 } from "@omniroute/open-sse/services/accountFallback.ts";
 import { getModelInfo, getComboForModel } from "../services/model";
 import { resolveBareModelToConnectionDefault } from "@omniroute/open-sse/services/model.ts";
@@ -314,11 +317,7 @@ export async function handleChat(
       }
     }
     if (b.max_tokens !== undefined) {
-      if (
-        typeof b.max_tokens !== "number" ||
-        !Number.isInteger(b.max_tokens) ||
-        b.max_tokens < 1
-      ) {
+      if (typeof b.max_tokens !== "number" || !Number.isInteger(b.max_tokens) || b.max_tokens < 1) {
         return badParam("max_tokens", "must be a positive integer");
       }
     }
@@ -1298,7 +1297,12 @@ async function handleSingleModelChat(
           provider,
           model,
           lastError,
-          lastStatus
+          lastStatus,
+          // Prefer the connection selector's view of how many accounts are
+          // actually unavailable (not just how many THIS request tried).
+          // When all 13 accounts have hit daily quota, this returns 13
+          // rather than the misleading local-loop count.
+          credentials?.unavailableCount ?? (excludedConnectionIds.size || null)
         );
         const lastFailedConnectionId =
           excludedConnectionIds.size > 0
@@ -1700,6 +1704,21 @@ async function handleSingleModelChat(
         }
 
         dailyQuotaExhausted = true;
+        // #4791: shadow-lock this connection in-memory so concurrent sibling
+        // requests in the same process skip it on their NEXT selector pass
+        // (instant, no DB roundtrip). The DB write of rateLimitedUntil is the
+        // durable source of truth (set later in markAccountUnavailable), but
+        // two concurrent requests can both read "available" before either
+        // write lands — both then pick the same exhausted account, both hit
+        // 429, both fall back to the same healthy account. The shadow closes
+        // that window for daily-quota 429s only (transient/per-minute 429s
+        // leave the shadow empty — short cooldowns are handled by the DB).
+        if (mlSettings.enabled && mlSettings.errorCodes.includes(result.status)) {
+          const msUntilTomorrow = getMsUntilTomorrow();
+          const tomorrowMidnightMs =
+            Date.now() + Math.min(msUntilTomorrow, DAILY_QUOTA_COOLDOWN_CAP_MS);
+          markFromDailyQuota(credentials.connectionId, tomorrowMidnightMs);
+        }
       }
 
       // 7. Mark account as quota-exhausted only for explicit long-window quota signals.

@@ -101,7 +101,26 @@ export class CloudflareAIExecutor extends BaseExecutor {
       msg && Array.isArray(msg.content) ? { ...msg, content: flattenContent(msg.content) } : msg
     );
 
-    return { ...body, messages };
+    // Cloudflare's reasoning models only accept a subset of reasoning_effort values:
+    //   - @cf/zai-org/glm-5.2         → "max" only (sending "high"/"low" returns 400)
+    //   - @cf/deepseek-ai/...r1-distill → accepts "low"|"medium"|"high"
+    //   - @cf/qwen/qwq-32b              → accepts "low"|"medium"|"high"
+    //
+    // Clamp reasoning_effort for glm-5.2 (and any future "max-only" reasoning model) so
+    // upstream CLI variants (--variant high in opencode, etc.) don't 400 the request.
+    // This mirrors the buildBody() behavior in the companion ai-proxy project.
+    const out: Record<string, unknown> = { ...body, messages };
+    const modelId = _model ?? "";
+    if (modelId.includes("glm-5.2")) {
+      const effort = body.reasoning_effort;
+      if (effort === undefined || effort === null) {
+        out.reasoning_effort = "max";
+      } else if (effort !== "max") {
+        out.reasoning_effort = "max";
+      }
+    }
+
+    return out;
   }
 }
 

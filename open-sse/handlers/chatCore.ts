@@ -213,6 +213,7 @@ import { runPluginOnResponseHook } from "./chatCore/pluginOnResponse.ts";
 import { scheduleStreamingQuotaShareConsumption } from "./chatCore/streamingQuotaShare.ts";
 import { recordStreamingUsageStats } from "./chatCore/streamingUsageStats.ts";
 import { recordStreamingCost } from "./chatCore/streamingCost.ts";
+import { detectZeroOutputQuotaExhaustion } from "./chatCore/zeroOutputQuotaGuard.ts";
 import {
   appendNonStreamingSseTerminalSignal,
   type NonStreamingSseTerminalState,
@@ -270,7 +271,13 @@ import {
   acquire as acquireAccountSemaphore,
   markBlocked as markAccountSemaphoreBlocked,
 } from "../services/accountSemaphore.ts";
-import { lockModel, lockModelIfPerModelQuota } from "../services/accountFallback.ts";
+import {
+  lockModel,
+  lockModelIfPerModelQuota,
+  isDailyQuotaExhausted,
+  getMsUntilTomorrow,
+  DAILY_QUOTA_COOLDOWN_CAP_MS,
+} from "../services/accountFallback.ts";
 import {
   generateSignature,
   getCachedResponse,
@@ -3271,13 +3278,42 @@ export async function handleChatCore({
               `[provider] Node ${errorConnectionId} ${quotaScope}-only quota exhausted (${statusCode}) for ${model} - ${Math.ceil(quotaCooldownMs / 1000)}s (cooldown_scope=${quotaScope}, ttl_source=${retryAfterMs ? "upstream" : "inferred"}, connection stays active)`
             );
           } else {
-            await updateProviderConnection(errorConnectionId, {
-              testStatus: "credits_exhausted",
-              lastErrorType: errorType,
-              lastError: message,
-              errorCode: statusCode,
-            });
-            console.warn(`[provider] Node ${errorConnectionId} exhausted quota (${statusCode})`);
+            // Distinguish terminal credit exhaustion (needs payment, never
+            // recovers) from recoverable daily-quota exhaustion (resets at
+            // next UTC midnight, capped at 16h). Without this split,
+            // Cloudflare Workers AI's free-tier daily neuron cap would
+            // permanently disable accounts that would otherwise recover
+            // automatically.
+            //
+            // isDailyQuotaExhausted() matches body text like:
+            //   - "daily free allocation"  (Cloudflare Workers AI)
+            //   - "daily quota"            (OpenAI, Gemini)
+            //   - "try again tomorrow"     (Anthropic, Moonshot)
+            // Anything else with QUOTA_EXHAUSTED (insufficient_quota,
+            // billing_hard_limit_reached, etc.) is genuine credit
+            // exhaustion and stays terminal.
+            if (isDailyQuotaExhausted(message)) {
+              const msUntilTomorrow = getMsUntilTomorrow();
+              const cooldownMs = Math.min(msUntilTomorrow, DAILY_QUOTA_COOLDOWN_CAP_MS);
+              await updateProviderConnection(errorConnectionId, {
+                rateLimitedUntil: new Date(Date.now() + cooldownMs).toISOString(),
+                testStatus: "unavailable",
+                lastErrorType: errorType,
+                lastError: `Daily quota exhausted — recovering in ${Math.ceil(cooldownMs / 3_600_000)}h`,
+                errorCode: statusCode,
+              });
+              console.warn(
+                `[provider] Node ${errorConnectionId} daily quota exhausted (${statusCode}) — recovering in ${Math.ceil(cooldownMs / 3_600_000)}h (auto-resets at UTC midnight, capped at 16h)`
+              );
+            } else {
+              await updateProviderConnection(errorConnectionId, {
+                testStatus: "credits_exhausted",
+                lastErrorType: errorType,
+                lastError: message,
+                errorCode: statusCode,
+              });
+              console.warn(`[provider] Node ${errorConnectionId} exhausted quota (${statusCode})`);
+            }
           }
         } else if (errorType === PROVIDER_ERROR_TYPES.UNAUTHORIZED) {
           // Normal 401 (token/session auth issue): keep account active for refresh/re-auth.
@@ -4181,6 +4217,13 @@ export async function handleChatCore({
   let streamFailureCompletionRecorded = false;
 
   // Callback to save call log when stream completes (include responseBody when provided by stream)
+  // #4791 zero-output guard: closure variables that the post-stream buffer pass
+  // reads AFTER consuming the entire upstream stream. Without these, the buffer
+  // pass can't see the final token counts to decide whether to retry on a
+  // healthy account (instead of returning the empty body to the agent, which
+  // causes the agent's UI to show "model stopped" and abort the build).
+  let finalStreamUsage: unknown = null;
+  let finalStreamResponseBody: unknown = null;
   const onStreamComplete = ({
     status: streamStatus,
     usage: streamUsage,
@@ -4198,6 +4241,10 @@ export async function handleChatCore({
       if (streamFailureCompletionRecorded) return;
       streamFailureCompletionRecorded = true;
     }
+    // #4791 zero-output guard: capture into closure so the buffer-and-retry
+    // pass below can decide whether the just-consumed stream was empty.
+    finalStreamUsage = streamUsage;
+    finalStreamResponseBody = streamResponseBody;
     const cacheUsageLogMeta = buildCacheUsageLogMeta(streamUsage);
     const streamConnectionId = getCurrentConnectionId();
 
@@ -4271,6 +4318,32 @@ export async function handleChatCore({
       comboStrategy,
       endpoint: endpointPath,
     });
+
+    // #4791 zero-output guard: when Cloudflare Workers AI hits its daily
+    // neuron cap MID-stream it returns HTTP 200 with empty content instead of
+    // a 429. The proxy can't tell from the status code alone, but the token
+    // signature (prompt > 0, completion = 0, cache_read ≈ prompt) is the
+    // unmistakable pattern. Quarantine the connection in DB + in-memory so
+    // the *next* request in this session rotates to a healthy account —
+    // agents that retry automatically get a non-empty response without the
+    // user noticing. Best-effort, fire-and-forget; if the imports fail the
+    // existing daily-quota body-text path will eventually catch up.
+    if (
+      normalizedStreamStatus === 200 &&
+      streamConnectionId &&
+      streamUsage &&
+      typeof streamUsage === "object"
+    ) {
+      const detection = detectZeroOutputQuotaExhaustion(streamUsage, streamResponseBody);
+      if (detection.detected) {
+        void quarantineConnectionForZeroOutput({
+          provider,
+          model,
+          connectionId: streamConnectionId,
+          usage: detection,
+        });
+      }
+    }
 
     persistAttemptLogs({
       status: normalizedStreamStatus,

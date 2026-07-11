@@ -54,6 +54,11 @@ const BEDROCK_CLAUDE_ALIASES = (...modelIds: string[]) => [
 const AUTHORITATIVE_CONTEXT_WINDOW_MODEL_IDS = new Set(["glm-5.2", "glm-5.2-high", "glm-5.2-max"]);
 const AUTHORITATIVE_PROVIDER_CONTEXT_WINDOWS = new Map<string, number>([
   ["cloudflare-ai/@cf/zai-org/glm-5.2", 262144],
+  // NVIDIA NIM z-ai/glm-5.2 — verified by live probe of
+  // integrate.api.nvidia.com on 2026-07-09 (250,620-token request →
+  // "maximum context length is 202752 tokens"). Listed per-provider so combo
+  // routing, headroom, and context-optimized strategies get the right cap.
+  ["nvidia/z-ai/glm-5.2", 202752],
   // Hugging Face Router has 1M-capable backends, but bare routing can select
   // lower-context providers (notably Together at 262K), so advertise a safe floor
   // unless the caller can pin a 1M-capable backend.

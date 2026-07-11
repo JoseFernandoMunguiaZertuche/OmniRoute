@@ -1204,24 +1204,53 @@ export function classifyError(
 // ─── Daily Quota Helpers ────────────────────────────────────────────────────
 
 /**
+ * Maximum cooldown applied for daily-quota exhaustion.
+ *
+ * Most providers reset at UTC midnight, so getMsUntilTomorrow() is usually
+ * <16h. We cap at 16h so that an account hit early in the UTC day still
+ * becomes usable within a reasonable window — without the cap, hitting a
+ * quota at 02:00 UTC would mean a 22h cooldown, when the next reset is
+ * already <24h away and a 16h retry will succeed.
+ */
+export const DAILY_QUOTA_COOLDOWN_CAP_MS = 16 * 60 * 60 * 1000;
+
+/**
  * Calculate milliseconds from now until tomorrow at midnight (00:00:00).
  * Used to lock a model until the next day when daily quota is exhausted.
- * @returns {number} Milliseconds until tomorrow
+ *
+ * Uses **UTC** midnight, not local midnight — most providers (Cloudflare
+ * Workers AI, OpenAI, Anthropic, Google) reset their daily quotas at UTC
+ * 00:00, so the server's local timezone would otherwise produce an off-by-
+ * up-to-24h cooldown.
+ *
+ * @returns {number} Milliseconds until next UTC midnight
  */
 export function getMsUntilTomorrow(): number {
   const nowMs = Date.now();
   const tomorrow = new Date(nowMs);
-  tomorrow.setDate(tomorrow.getDate() + 1);
-  tomorrow.setHours(0, 0, 0, 0);
+  // setUTCHours(24, ...) sets the Date to the next UTC day at 00:00:00,
+  // rolling over from 23:59:59.999 → 00:00:00.000 of the following day.
+  tomorrow.setUTCHours(24, 0, 0, 0);
   const ms = tomorrow.getTime() - nowMs;
-  // Guard against DST edge cases: if ms is negative (shouldn't happen) or
-  // unreasonably large (>25h due to spring-forward), cap at 24 hours.
+  // Guard against DST/edge cases: if ms is negative or unreasonably large
+  // (>25h), fall back to the 24h baseline so callers always get a sane value.
   return ms > 0 && ms <= 25 * 60 * 60 * 1000 ? ms : 24 * 60 * 60 * 1000;
 }
 
 /**
  * Check if error text indicates daily quota exhaustion (as opposed to rate limiting).
- * Daily quota errors typically mention "today's quota" or "try again tomorrow".
+ *
+ * Matched patterns:
+ *  - "today's quota" / "daily quota" — generic phrasing (Gemini, OpenAI)
+ *  - "try again tomorrow" — generic phrasing (Anthropic, Moonshot)
+ *  - "daily free allocation" — Cloudflare Workers AI ("you have used up your
+ *    daily free allocation of N neurons"). This is the free-tier daily
+ *    neuron cap, distinct from per-minute RPM rate limits, and requires a
+ *    multi-hour cooldown (account recovers at next UTC midnight, capped at
+ *    16h — see DAILY_QUOTA_COOLDOWN_CAP_MS).
+ *  - "daily request limit" / "daily allowance" — alternate phrasings seen
+ *    across rate-limited free APIs (GitHub Models, etc.).
+ *
  * @param {string} errorText - Error message text
  * @returns {boolean} True if daily quota is exhausted
  */
@@ -1231,7 +1260,10 @@ export function isDailyQuotaExhausted(errorText: string): boolean {
   return (
     lower.includes("today's quota") ||
     lower.includes("daily quota") ||
-    lower.includes("try again tomorrow")
+    lower.includes("try again tomorrow") ||
+    lower.includes("daily free allocation") ||
+    lower.includes("daily request limit") ||
+    lower.includes("daily allowance")
   );
 }
 
@@ -1442,11 +1474,27 @@ export function checkFallbackError(
       };
     }
 
-    // Daily quota exhausted — lock model until tomorrow
-    if (shouldUseQuotaSignal && isDailyQuotaExhausted(errorStr)) {
+    // Daily quota exhausted — lock connection until the next UTC-midnight reset.
+    //
+    // Detection is body-text based (see isDailyQuotaExhausted), so it fires
+    // for ANY provider category (api-key vs oauth) and ANY status code
+    // (typically 429 or 402). The previous shouldUseQuotaSignal gate was
+    // meant for "OAuth 429 with body that LOOKS like quota but is really
+    // per-minute RPM" — but the body-text matcher is specific enough
+    // (Cloudflare's "daily free allocation", OpenAI's "today's quota",
+    // etc.) that a positive match is genuinely a quota issue.
+    //
+    // Without this fix, Cloudflare Workers AI's free-tier daily neuron cap
+    // would fall through to the generic 429 RATE_LIMITED path, hammer the
+    // same account with escalating backoff (5s → 10s → 20s → ...), and
+    // never actually recover — every retry would hit the same 429 because
+    // the daily quota hasn't reset yet.
+    if (isDailyQuotaExhausted(errorStr)) {
       const msUntilTomorrow = getMsUntilTomorrow();
-      // Cap at 24 hours to handle timezone edge cases
-      const cooldownMs = Math.min(msUntilTomorrow, 24 * 60 * 60 * 1000);
+      // Cap at 16h: hitting a quota early in the UTC day would otherwise
+      // mean a 22h cooldown. After 16h the next UTC-midnight reset has
+      // already happened, so a retry will succeed.
+      const cooldownMs = Math.min(msUntilTomorrow, DAILY_QUOTA_COOLDOWN_CAP_MS);
       return {
         shouldFallback: true,
         cooldownMs,

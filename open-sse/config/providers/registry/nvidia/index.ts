@@ -10,7 +10,11 @@ export const nvidiaProvider: RegistryEntry = {
   authHeader: "bearer",
   models: [
     // #6108: z-ai/glm-5.1 EOL'd 2026-07-02 (direct probe returns 410) — dropped.
-    { id: "z-ai/glm-5.2", name: "GLM 5.2" },
+    // Context 202,752 verified by live probe of integrate.api.nvidia.com on
+    // 2026-07-09 (request at 250,620 prompt tokens → 400 with "maximum context
+    // length is 202752 tokens"). Combo routing now treats NVIDIA's overflow
+    // error as recoverable (was previously miscategorized as body-specific).
+    { id: "z-ai/glm-5.2", name: "GLM 5.2", contextLength: 202752 },
     // #3329/#6108: minimaxai/minimax-m3 stays excluded from the nvidia tier — it
     // still 404s here for most callers; the single 200 probe in #6108 was not
     // reproducible enough to override the #3329 guard. Re-add only once NVIDIA

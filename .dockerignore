@@ -9,10 +9,13 @@
 # Dependencies and build output
 node_modules
 .next
-.build
+.build/*
+!.build/next/standalone/
+!.build/next/static/
 out
 build
 dist
+!dist/
 coverage
 
 # Runtime data and logs

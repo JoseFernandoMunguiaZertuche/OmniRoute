@@ -419,8 +419,65 @@ export async function buildAutoCandidates(
     }
   );
 
+  // Fork: Smart provider-skip. Layered on top of upstream's #1731 in-loop exhaustion
+  // tracking. Upstream's tracking is reactive (populates `exhaustedProviders` after an
+  // attempt fails); this is proactive — if every account of a provider is already
+  // runtime-unhealthy from a PRIOR request (rate_limited_until in the future, test_status
+  // expired/unavailable), drop all targets for that provider before any attempt fires so
+  // we don't burn N × ~100ms failing each one. If at least one account is healthy, keep
+  // all targets for that provider and let rotation/upstream-tracking pick the working one.
+  const providerHealthyCache = new Map<string, boolean>();
+  const skippedProviders: string[] = [];
+  const isConnectionRuntimeHealthy = (c: Record<string, unknown> | undefined): boolean => {
+    if (!c) return false;
+    const testStatus = typeof c.test_status === "string" ? c.test_status : "";
+    if (testStatus === "expired") return false;
+    if (
+      testStatus === "unavailable" &&
+      hasFutureRateLimitUntil(c.rate_limited_until ?? c.rateLimitedUntil)
+    ) {
+      return false;
+    }
+    if (hasFutureRateLimitUntil(c.rate_limited_until ?? c.rateLimitedUntil)) return false;
+    return true;
+  };
+  const isProviderRuntimeHealthy = (provider: string): boolean => {
+    if (providerHealthyCache.has(provider)) {
+      return providerHealthyCache.get(provider) === true;
+    }
+    if (provider === "unknown") {
+      providerHealthyCache.set(provider, true);
+      return true;
+    }
+    const conns = connectionsByProvider.get(provider) || [];
+    if (conns.length === 0) {
+      providerHealthyCache.set(provider, true);
+      return true;
+    }
+    const anyHealthy = conns.some(isConnectionRuntimeHealthy);
+    providerHealthyCache.set(provider, anyHealthy);
+    return anyHealthy;
+  };
+  const smartSkippedTargets = fingerprintExpandedTargets.filter((t) => {
+    const provider =
+      t.provider ||
+      parseModel(t.modelStr).provider ||
+      parseModel(t.modelStr).providerAlias ||
+      "unknown";
+    if (isProviderRuntimeHealthy(provider)) return true;
+    if (!skippedProviders.includes(provider)) skippedProviders.push(provider);
+    return false;
+  });
+  if (skippedProviders.length > 0) {
+    log.info(
+      "COMBO",
+      `Smart-skip: provider(s) fully exhausted at runtime — skipping all targets for: ${skippedProviders.join(", ")} (falling through to next provider without per-account retry)`
+    );
+  }
+  const smartExpandedTargets = smartSkippedTargets;
+
   const candidates = await Promise.all(
-    fingerprintExpandedTargets.map(async (target) => {
+    smartExpandedTargets.map(async (target) => {
       const modelStr = target.modelStr;
       const parsed = parseModel(modelStr);
       const provider = target.provider || parsed.provider || parsed.providerAlias || "unknown";
@@ -663,7 +720,13 @@ export function isContextOverflow400(errorText) {
   return (
     /\bcontext.*(?:length_exceeded|too long|overflow|exceeded|window|limit)\b/i.test(errorText) ||
     /exceeds.*context/i.test(errorText) ||
-    /your input exceeds/i.test(errorText)
+    /your input exceeds/i.test(errorText) ||
+    // Fork: NVIDIA NIM phrasing — "maximum context length is 202752 tokens" — does
+    // not match the generic pattern above (it lacks one of the alternation
+    // keywords like "exceeded"/"overflow"). Without this branch a 400 with that
+    // text falls through as if body-specific and aborts the combo instead of
+    // landing on the next target.
+    /maximum context length is \d+ tokens/i.test(errorText)
   );
 }
 /** @param {string} errorText */
@@ -2499,9 +2562,7 @@ async function handleRoundRobinCombo({
   // runtime-unavailable, we must reconsider these before returning 503, instead of
   // permanently dropping a compat-rejected-but-healthy provider.
   const compatKeptSet = new Set(filteredTargets);
-  const compatRejectedTargets = evalRankedTargets.filter(
-    (target) => !compatKeptSet.has(target)
-  );
+  const compatRejectedTargets = evalRankedTargets.filter((target) => !compatKeptSet.has(target));
   const modelCount = filteredTargets.length;
   if (modelCount === 0) {
     return comboModelNotFoundResponse("Round-robin combo has no executable targets");

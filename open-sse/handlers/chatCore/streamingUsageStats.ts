@@ -14,6 +14,8 @@ import { saveRequestUsage } from "@/lib/usageDb";
 import { recordTokenUsage } from "../../services/tokenLimitCounter.ts";
 import { computeBillableTokens } from "./upstreamTimeouts.ts";
 import { type EffectiveServiceTier } from "./serviceTier.ts";
+import { accumulateDailyTokens } from "../../../src/sse/services/dailyTokenTracker.ts";
+import { updateProviderConnection } from "@/lib/localDb";
 
 export type RecordStreamingUsageStatsContext = {
   provider: string | null | undefined;
@@ -76,4 +78,35 @@ export function recordStreamingUsageStats(
   if (!usage || typeof usage !== "object") return;
   persistStreamingUsageRow(usage, ctx);
   recordStreamingBillableTokens(usage, ctx);
+  // #4791 proactive quota guard: accumulate this request's tokens into the
+  // connection's daily running total. The selector filter reads this to skip
+  // accounts near Cloudflare's 10K-neuron daily cap BEFORE sending the next
+  // request, preventing the 0-output stream that aborts the agent's build.
+  // Fire-and-forget: a failed write doesn't block the stream-completion path;
+  // the next request's selector pass will see a slightly stale total, but
+  // the existing 0-output detection + quarantine covers the worst case.
+  if (ctx.connectionId && ctx.streamStatus === 200) {
+    void accumulateAndPersistDailyTokens(ctx.connectionId, usage);
+  }
+}
+
+async function accumulateAndPersistDailyTokens(
+  connectionId: string,
+  usage: unknown
+): Promise<void> {
+  try {
+    const { getProviderConnectionById } = await import("@/lib/localDb");
+    const row = await getProviderConnectionById(connectionId);
+    if (!row) return;
+    const psd = (row.providerSpecificData as Record<string, unknown> | null) ?? {};
+    const next = accumulateDailyTokens(psd, usage);
+    if (next.total === (psd.dailyTokenUsage as { total?: number } | undefined)?.total) {
+      return; // no change
+    }
+    await updateProviderConnection(connectionId, {
+      providerSpecificData: { ...psd, dailyTokenUsage: next },
+    } as Record<string, unknown>);
+  } catch {
+    // best-effort
+  }
 }

@@ -16,6 +16,8 @@ import { COLORS } from "../../utils/stream.ts";
 import { recordTokenUsage } from "../../services/tokenLimitCounter.ts";
 import { computeBillableTokens } from "./upstreamTimeouts.ts";
 import { type EffectiveServiceTier } from "./serviceTier.ts";
+import { accumulateDailyTokens } from "../../../src/sse/services/dailyTokenTracker.ts";
+import { updateProviderConnection } from "@/lib/localDb";
 
 export type RecordNonStreamingUsageStatsContext = {
   traceEnabled: boolean;
@@ -87,4 +89,37 @@ export function recordNonStreamingUsageStats(
   if (ctx.traceEnabled) logUsageTrace(usage, ctx.provider, ctx.connectionId);
   persistUsageRow(usage, ctx);
   recordBillableTokens(usage, ctx.apiKeyInfo, ctx.provider, ctx.model);
+  // #4791 proactive quota guard: accumulate this request's tokens into the
+  // connection's daily running total (same hook as the streaming path). The
+  // selector filter reads this to skip accounts near Cloudflare's 10K-neuron
+  // daily cap BEFORE sending the next request, preventing the 0-output
+  // stream that aborts the agent's build.
+  if (ctx.connectionId) {
+    void accumulateAndPersistDailyTokens(ctx.connectionId, usage);
+    // Diagnostic: log actual values to verify the accumulator is reading the right thing
+    const u = usage as Record<string, unknown>;
+    console.log(
+      `[DAILY_TOKEN_DEBUG] ${ctx.provider}/${ctx.model} conn=${ctx.connectionId.slice(0, 8)} prompt=${u.prompt_tokens ?? "?"} completion=${u.completion_tokens ?? "?"} total_field=${u.total_tokens ?? "?"} cached=${u.cached_tokens ?? "?"} reasoning=${u.reasoning_tokens ?? "?"}`
+    );
+  }
+}
+
+async function accumulateAndPersistDailyTokens(
+  connectionId: string,
+  usage: unknown
+): Promise<void> {
+  try {
+    const { getProviderConnectionById } = await import("@/lib/localDb");
+    const row = await getProviderConnectionById(connectionId);
+    if (!row) return;
+    const psd = (row.providerSpecificData as Record<string, unknown> | null) ?? {};
+    const next = accumulateDailyTokens(psd, usage);
+    const prevTotal = (psd.dailyTokenUsage as { total?: number } | undefined)?.total;
+    if (next.total === prevTotal) return;
+    await updateProviderConnection(connectionId, {
+      providerSpecificData: { ...psd, dailyTokenUsage: next },
+    } as Record<string, unknown>);
+  } catch {
+    // best-effort
+  }
 }

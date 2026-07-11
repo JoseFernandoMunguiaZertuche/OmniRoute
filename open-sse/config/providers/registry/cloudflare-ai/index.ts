@@ -27,6 +27,11 @@ export const cloudflare_aiProvider: RegistryEntry = {
       name: "GLM 4.7 Flash (🆓)",
       contextLength: 131072,
     },
+    {
+      id: "@cf/zai-org/glm-5.2",
+      name: "GLM 5.2 (🆓)",
+      contextLength: 262144,
+    },
     { id: "@cf/moonshotai/kimi-k2.6", name: "Kimi K2.6 (🆓)", contextLength: 262144 },
     { id: "@cf/google/gemma-4-26b-a4b-it", name: "Gemma 4 26B (🆓)", contextLength: 262144 },
   ],

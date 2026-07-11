@@ -566,8 +566,10 @@ export function handleNoCredentials(
   provider: string,
   model: string,
   lastError: string | null,
-  lastStatus: number | null
+  lastStatus: number | null,
+  triedCount: number | null = null
 ) {
+  const totalAccounts = typeof triedCount === "number" && triedCount > 0 ? triedCount : 1;
   if (credentials?.allRateLimited) {
     const errorMsg = lastError || credentials.lastError || "Unavailable";
     const status =
@@ -587,19 +589,21 @@ export function handleNoCredentials(
       return modelCooldownResponse({
         model: cooldownModel,
         retryAfter: credentials.retryAfter,
-        retryAfterAt:
-          typeof credentials.retryAfter === "string" ? credentials.retryAfter : null,
+        retryAfterAt: typeof credentials.retryAfter === "string" ? credentials.retryAfter : null,
         credentialsCoolingCount:
-          typeof credentials.connectionsCount === "number"
-            ? credentials.connectionsCount
-            : null,
+          typeof credentials.connectionsCount === "number" ? credentials.connectionsCount : null,
       });
     }
 
-    log.warn("CHAT", `[${provider}/${model}] ${errorMsg} (${credentials.retryAfterHuman})`);
+    log.warn(
+      "CHAT",
+      `All ${totalAccounts} ${provider} account(s) failed or are cooling down${
+        credentials.retryAfterHuman ? ` (${credentials.retryAfterHuman})` : ""
+      } — last: ${errorMsg}`
+    );
     return unavailableResponse(
       status,
-      `[${provider}/${model}] ${errorMsg}`,
+      `All ${totalAccounts} ${provider} account(s) failed or are cooling down — last: ${errorMsg}`,
       credentials.retryAfter,
       credentials.retryAfterHuman
     );
@@ -611,7 +615,7 @@ export function handleNoCredentials(
     // instead of the generic 400 "No credentials", so dashboards/CLIs can
     // distinguish "never configured" from "needs to reconnect".
     const status = credentials.expiredStatus || "expired";
-    const count = credentials.expiredCount || 1;
+    const count = credentials.expiredCount || totalAccounts;
     const reason =
       status === "credits_exhausted"
         ? "credits exhausted"
@@ -623,12 +627,15 @@ export function handleNoCredentials(
     return errorResponse(HTTP_STATUS.UNAUTHORIZED, message);
   }
   if (lastError && lastStatus) {
-    log.warn("CHAT", "Preserving last upstream error after credential exhaustion", {
-      provider,
-      model,
+    log.warn(
+      "CHAT",
+      `All ${totalAccounts} ${provider} account(s) failed — preserving last upstream error`,
+      { provider, model, lastStatus }
+    );
+    return errorResponse(
       lastStatus,
-    });
-    return errorResponse(lastStatus, lastError);
+      `All ${totalAccounts} ${provider} account(s) failed — last: ${lastError}`
+    );
   }
   if (!excludeConnectionId) {
     // Ported from upstream decolua/9router#336 (Ibrahim Ryan): surface as 404
@@ -644,10 +651,10 @@ export function handleNoCredentials(
     log.warn("AUTH", `No active credentials for provider: ${provider}`);
     return errorResponse(HTTP_STATUS.NOT_FOUND, `No active credentials for provider: ${provider}`);
   }
-  log.warn("CHAT", "No more accounts available", { provider });
+  log.warn("CHAT", `All ${totalAccounts} ${provider} account(s) exhausted`, { provider });
   return errorResponse(
     lastStatus || HTTP_STATUS.SERVICE_UNAVAILABLE,
-    lastError || "All accounts unavailable"
+    `All ${totalAccounts} ${provider} account(s) failed or are cooling down`
   );
 }
 
@@ -708,7 +715,10 @@ export async function safeResolveProxy(connectionId: string, apiKeyId?: string) 
     // is dead/inactive must fail closed — egressing on the real IP leaks it. Reuse
     // the existing proxy-resolution-failure policy (blocks by default; PROXY_FAIL_OPEN
     // opts back into direct). Explicit "proxy off" is not a leak (see the guard).
-    if (!(resolved as { proxy?: unknown } | null)?.proxy && hasBlockingProxyAssignment(connectionId)) {
+    if (
+      !(resolved as { proxy?: unknown } | null)?.proxy &&
+      hasBlockingProxyAssignment(connectionId)
+    ) {
       return decideProxyResolutionFailure(
         Object.assign(
           new Error(

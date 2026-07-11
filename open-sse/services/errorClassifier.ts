@@ -134,13 +134,21 @@ export function classifyProviderError(
     return PROVIDER_ERROR_TYPES.QUOTA_EXHAUSTED;
   }
 
-  // API-key providers route 429 cooldowns through the resilience-aware fallback layer.
-  // OAuth providers keep their existing quota semantics because some of them encode
-  // longer quota windows as 429 responses.
+  // 429 can mean either transient rate-limit OR daily-quota-exhausted.
+  // Detection is body-text based (see isDailyQuotaExhausted), so it fires
+  // for ANY provider category (api-key vs oauth). The previous
+  // preserveQuota429 gate was meant for OAuth 429s that LOOK like quota
+  // but are really per-minute RPM — but the body-text matcher is specific
+  // enough (Cloudflare's "daily free allocation", OpenAI's "today's
+  // quota", etc.) that a positive match is genuinely a quota issue
+  // regardless of provider category.
   if (statusCode === 429) {
-    if (preserveQuota429 && isDailyQuotaExhausted(bodyStr)) {
+    if (isDailyQuotaExhausted(bodyStr)) {
       return PROVIDER_ERROR_TYPES.QUOTA_EXHAUSTED;
     }
+    // preserveQuota429 is still consulted below for non-daily-quota 429s
+    // — OAuth 429s may encode longer quota windows as plain 429 bodies.
+    void preserveQuota429;
     return PROVIDER_ERROR_TYPES.RATE_LIMITED;
   }
 
