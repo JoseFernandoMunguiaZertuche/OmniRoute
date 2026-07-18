@@ -130,6 +130,15 @@ export async function validateResponseQuality(
     let hasLifecycleEnd = false;
     let anyContentFound = false;
     let sawAnyBytes = false;
+    // OpenAI-style streaming state (#5297 fix: detect "stop with empty choices"
+    // emitted by some upstream models like GLM 5.2 on NVIDIA — they send a
+    // `choices: [{delta: {}, finish_reason: 'stop'}]` chunk and then [DONE] with
+    // no content, no tool_calls, no reasoning. Previously this slipped through
+    // because we only watched the Claude content_block_* lifecycle.
+    let hasOpenAIChoice = false;
+    let hasOpenAIStopOrToolCalls = false;
+    let openAICompletionTokens = 0;
+    let openAIReasoningTokens = 0;
     const sseLineNormalizer = createSSEDataLineNormalizer();
     let pendingEventType = "";
 
@@ -174,6 +183,52 @@ export async function validateResponseQuality(
         pendingEventType = "";
 
         if (isKnownNonClaudeStreamPayload(parsed, eventType)) {
+          // #5297 — OpenAI-style streaming: track whether any choice emitted
+          // content / tool_calls / reasoning, and whether the stream reached a
+          // terminal finish_reason. At end-of-stream, if the stream completed
+          // but emitted no valuable content, treat as invalid for combo
+          // failover / retry.
+          const choices = parsed.choices;
+          if (Array.isArray(choices)) {
+            for (const choice of choices) {
+              if (!choice || typeof choice !== "object") continue;
+              const c = choice as Record<string, unknown>;
+              const delta = c.delta as Record<string, unknown> | undefined;
+              const finish = c.finish_reason as string | null | undefined;
+              if (Array.isArray(delta?.tool_calls) && (delta.tool_calls as unknown[]).length > 0) {
+                anyContentFound = true;
+              }
+              const deltaContent = delta?.content;
+              if (typeof deltaContent === "string" && deltaContent.length > 0) {
+                anyContentFound = true;
+              }
+              const deltaReasoning =
+                (delta?.reasoning_content as string | undefined) ??
+                (delta?.reasoning as string | undefined);
+              if (typeof deltaReasoning === "string" && deltaReasoning.length > 0) {
+                anyContentFound = true;
+              }
+              if (finish === "stop" || finish === "tool_calls" || finish === "length") {
+                hasOpenAIStopOrToolCalls = true;
+                hasOpenAIChoice = true;
+              } else if (delta && typeof delta === "object" && Object.keys(delta).length > 0) {
+                // Any non-empty delta (role, content, etc.) means we saw a real choice.
+                if (
+                  typeof delta.role === "string" ||
+                  deltaContent ||
+                  deltaReasoning ||
+                  Array.isArray(delta.tool_calls)
+                ) {
+                  hasOpenAIChoice = true;
+                }
+              }
+            }
+            if (parsed.usage && typeof parsed.usage === "object") {
+              const u = parsed.usage as Record<string, unknown>;
+              openAICompletionTokens = Number(u.completion_tokens ?? u.output_tokens ?? 0) || 0;
+              openAIReasoningTokens = Number(u.reasoning_tokens ?? u.reasoningTokens ?? 0) || 0;
+            }
+          }
           return true;
         }
 
@@ -265,6 +320,32 @@ export async function validateResponseQuality(
               "Streaming Claude response has complete lifecycle but zero content blocks (content_filter?) — marking as invalid for combo failover"
             );
             return { valid: false, reason: "streaming empty content block" };
+          }
+
+          // #5297 — OpenAI-style streaming: the stream reached a terminal
+          // finish_reason ("stop" or "tool_calls") but emitted NO content,
+          // NO tool_calls, and NO reasoning on any delta. This is the
+          // signature pattern of GLM 5.2 (and similar models) returning an
+          // empty assistant turn — it tells the agent "I'm done" with nothing
+          // to say, which causes opencode to terminate the loop prematurely.
+          // Mark as invalid so combo.ts falls through to the next target
+          // (or the per-target retry logic in handleSingleModel retries).
+          // Guard against false positives on legitimately-tiny responses
+          // (e.g. a 12-token "ok") by requiring completion_tokens >= 50 OR
+          // any reasoning_tokens > 0 — if usage confirms the model emitted
+          // meaningful tokens, the response is real even if no content
+          // reached the wire (rare but possible during thinking-heavy runs).
+          if (
+            !anyContentFound &&
+            hasOpenAIStopOrToolCalls &&
+            openAICompletionTokens < 100 &&
+            openAIReasoningTokens === 0
+          ) {
+            log.warn?.(
+              "COMBO",
+              `Streaming OpenAI-style response has terminal finish_reason but zero content/tool_calls/reasoning (completion_tokens=${openAICompletionTokens}) — marking as invalid for combo retry`
+            );
+            return { valid: false, reason: "streaming empty stop with no content" };
           }
 
           // Stream ended with a truly EMPTY body (e.g. Gemini returning HTTP
@@ -379,7 +460,9 @@ export async function validateResponseQuality(
   if (errorIsMeaningful) {
     const envelopeText = extractEnvelopeErrorText(json);
     const errMsg =
-      rawError && typeof rawError === "object" && typeof (rawError as Record<string, unknown>).message === "string"
+      rawError &&
+      typeof rawError === "object" &&
+      typeof (rawError as Record<string, unknown>).message === "string"
         ? ((rawError as Record<string, unknown>).message as string)
         : envelopeText || JSON.stringify(rawError).substring(0, 200);
     return { valid: false, reason: `upstream error in 200 body: ${errMsg}` };
@@ -387,8 +470,7 @@ export async function validateResponseQuality(
   {
     const envelopeText = extractEnvelopeErrorText(json);
     if (envelopeText && EXHAUSTION_MARKER_PATTERN.test(envelopeText)) {
-      const snippet =
-        envelopeText.length > 80 ? `${envelopeText.slice(0, 80)}…` : envelopeText;
+      const snippet = envelopeText.length > 80 ? `${envelopeText.slice(0, 80)}…` : envelopeText;
       return { valid: false, reason: `upstream exhaustion marker in 200 body: ${snippet}` };
     }
   }

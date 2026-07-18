@@ -2269,8 +2269,7 @@ export function createSSEStream(options: StreamOptions = {}) {
                     if (Array.isArray(flushedParsed.choices)) {
                       for (const choice of flushedParsed.choices as JsonRecord[]) {
                         const tcs = (choice as JsonRecord | undefined)?.delta as
-                          | JsonRecord
-                          | undefined;
+                          JsonRecord | undefined;
                         if (Array.isArray(tcs?.tool_calls)) {
                           for (const tc of tcs.tool_calls as JsonRecord[]) {
                             if (tc?.id != null && typeof tc.id !== "string") {
@@ -2412,6 +2411,32 @@ export function createSSEStream(options: StreamOptions = {}) {
                   content = "";
                 } else if (containsMalformedTextualToolCall(content, allowedToolNames)) {
                   content = "";
+                }
+                // #5297 fix: detect truly-empty responses and synthesize a non-empty
+                // content placeholder so opencode doesn't see finish=stop with null content
+                // (which makes the agent loop terminate). Only fires when:
+                //   - no content accumulated
+                //   - no reasoning accumulated
+                //   - no tool_calls (otherwise opencode would run them)
+                //   - completion_tokens < 100 (avoids false-positives on legit short replies)
+                const isTrulyEmpty =
+                  !content.trim() && !reasoning.trim() && passthroughToolCalls.size === 0;
+                if (isTrulyEmpty) {
+                  // Pick the synthesized placeholder based on completion_tokens:
+                  //   0: empty placeholder (model emitted nothing — likely just a finish marker)
+                  //   >0: model emitted meta-tokens (could be a thinking artifact)
+                  const completion = Number(
+                    (usage as Record<string, unknown> | null)?.completion_tokens ??
+                      (usage as Record<string, unknown> | null)?.output_tokens ??
+                      0
+                  );
+                  if (completion < 100) {
+                    content =
+                      "[Model returned an empty response — please continue with the next steps or call a tool]";
+                    console.warn(
+                      `[STREAM] Synthesized content for empty response (${provider || "provider"}:${model || "unknown"}, completion_tokens=${completion}) — sessionId=${sessionId}`
+                    );
+                  }
                 }
                 const message: Record<string, unknown> = {
                   role: "assistant",
@@ -2644,17 +2669,15 @@ export function createSSEStream(options: StreamOptions = {}) {
               let content = (state?.accumulatedContent ?? "").trim() || "";
               const normalizedToolCalls: ToolCall[] = state?.toolCalls?.size
                 ? [...state.toolCalls.values()]
-                    .map(
-                      (tc: Record<string, unknown>): ToolCall => ({
-                        id: tc.id != null ? String(tc.id) : null,
-                        index: (tc.index as number) ?? (tc.blockIndex as number) ?? 0,
-                        type: (tc.type as string) ?? "function",
-                        function: (tc.function as ToolCall["function"]) ?? {
-                          name: (tc.name as string) ?? "",
-                          arguments: "",
-                        },
-                      })
-                    )
+                    .map((tc: Record<string, unknown>): ToolCall => ({
+                      id: tc.id != null ? String(tc.id) : null,
+                      index: (tc.index as number) ?? (tc.blockIndex as number) ?? 0,
+                      type: (tc.type as string) ?? "function",
+                      function: (tc.function as ToolCall["function"]) ?? {
+                        name: (tc.name as string) ?? "",
+                        arguments: "",
+                      },
+                    }))
                     .sort((a, b) => a.index - b.index)
                 : [];
               const textualToolCall = parseTextualToolCallFromContent(content);
@@ -2671,6 +2694,22 @@ export function createSSEStream(options: StreamOptions = {}) {
                 content = "";
               } else if (containsMalformedTextualToolCall(content, allowedToolNames)) {
                 content = "";
+              }
+              // #5297 fix: detect truly-empty responses and synthesize non-empty content
+              // (same logic as passthrough path — see comment there)
+              if (!content.trim() && normalizedToolCalls.length === 0) {
+                const translateCompletion = Number(
+                  (state?.usage as Record<string, unknown> | null)?.completion_tokens ??
+                    (state?.usage as Record<string, unknown> | null)?.output_tokens ??
+                    0
+                );
+                if (translateCompletion < 100) {
+                  content =
+                    "[Model returned an empty response — please continue with the next steps or call a tool]";
+                  console.warn(
+                    `[STREAM] Synthesized content for empty translate response (${provider || "provider"}:${model || "unknown"}, completion_tokens=${translateCompletion}) — sessionId=${sessionId}`
+                  );
+                }
               }
               const message: Record<string, unknown> = {
                 role: "assistant",
