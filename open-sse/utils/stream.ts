@@ -2524,6 +2524,44 @@ export function createSSEStream(options: StreamOptions = {}) {
                     `[STREAM] Synthesized content for empty response (${provider || "provider"}:${model || "unknown"}, completion_tokens=${completion}) — sessionId=${sessionId}`
                   );
                 }
+                // Second synth: empty-content + tool_calls present.
+                // GLM 5.2 (NVIDIA NIM) with reasoning_effort=max commonly emits
+                // tool_calls as the sole output of a turn, with no visible content.
+                // Each such turn: opencode executes the tools, asks again, model emits
+                // more tool_calls (still no content). The loop continues (finish="tool_calls"
+                // keeps the agent alive) but the USER perceives "no progress for 5+ min"
+                // because nothing visible is rendered per step.
+                //
+                // Synthesize a brief visible progress placeholder when:
+                //   - finish will be "tool_calls" (passthroughHasToolCalls=true)
+                //   - content empty
+                //   - reasoning empty (so this is not a "thinking-only" step that already
+                //     surfaced reasoning_content to the client)
+                //
+                // Note: this does NOT alter finish_reason — it remains "tool_calls" so
+                // opencode still executes the tools and the loop continues normally.
+                if (
+                  passthroughHasToolCalls &&
+                  !content.trim() &&
+                  !reasoning.trim() &&
+                  passthroughToolCalls.size > 0
+                ) {
+                  const toolNames = [...passthroughToolCalls.values()]
+                    .map((tc) => tc.function?.name || "tool")
+                    .filter(Boolean)
+                    .slice(0, 3);
+                  const toolList = toolNames.length > 0 ? `: ${toolNames.join(", ")}` : "";
+                  content = `[Working${toolList}]`;
+                  console.warn(
+                    `[STREAM] Synthesized progress placeholder for empty content + tool_calls (${provider || "provider"}:${model || "unknown"}, tools=${passthroughToolCalls.size}) — sessionId=${sessionId}`
+                  );
+                } else if (passthroughHasToolCalls && !content.trim() && !reasoning.trim()) {
+                  // Hardening: log empty assistant response after tool completion
+                  // for observability — helps diagnose Copilot "Sorry, no response was returned"
+                  console.warn(
+                    `[STREAM] Empty assistant response after tool_calls completion (${provider || "provider"}:${model || "unknown"}) — sessionId=${sessionId}`
+                  );
+                }
                 const message: Record<string, unknown> = {
                   role: "assistant",
                   content: content || null,
@@ -2534,13 +2572,6 @@ export function createSSEStream(options: StreamOptions = {}) {
                 if (passthroughToolCalls.size > 0) {
                   message.tool_calls = [...passthroughToolCalls.values()].sort(
                     (a, b) => a.index - b.index
-                  );
-                }
-                // Hardening: log empty assistant response after tool completion
-                // for observability — helps diagnose Copilot "Sorry, no response was returned"
-                if (passthroughHasToolCalls && !content.trim() && !reasoning.trim()) {
-                  console.warn(
-                    `[STREAM] Empty assistant response after tool_calls completion (${provider || "provider"}:${model || "unknown"}) — sessionId=${sessionId}`
                   );
                 }
 
@@ -2796,11 +2827,25 @@ export function createSSEStream(options: StreamOptions = {}) {
                   `[STREAM] Synthesized content for empty translate response (${provider || "provider"}:${model || "unknown"}, completion_tokens=${translateCompletion}) — sessionId=${sessionId}`
                 );
               }
+              // Second synth (translate path): empty-content + tool_calls present.
+              // See passthrough path comment for full rationale. Keeps loop alive AND gives
+              // the user a visible per-step progress marker instead of pure silent tool_calls.
+              const hasToolCalls = normalizedToolCalls.length > 0;
+              if (hasToolCalls && !content.trim()) {
+                const toolNames = normalizedToolCalls
+                  .map((tc) => tc.function?.name || "tool")
+                  .filter(Boolean)
+                  .slice(0, 3);
+                const toolList = toolNames.length > 0 ? `: ${toolNames.join(", ")}` : "";
+                content = `[Working${toolList}]`;
+                console.warn(
+                  `[STREAM] Synthesized progress placeholder for empty translate content + tool_calls (${provider || "provider"}:${model || "unknown"}, tools=${normalizedToolCalls.length}) — sessionId=${sessionId}`
+                );
+              }
               const message: Record<string, unknown> = {
                 role: "assistant",
                 content: content || null,
               };
-              const hasToolCalls = normalizedToolCalls.length > 0;
               if (hasToolCalls) {
                 message.tool_calls = normalizedToolCalls;
               }
