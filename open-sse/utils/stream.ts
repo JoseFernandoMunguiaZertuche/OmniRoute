@@ -1927,6 +1927,76 @@ export function createSSEStream(options: StreamOptions = {}) {
                       `[STREAM] Synthesized bash noop tool_call for empty stop (${provider || "provider"}:${model || "unknown"}, completion_tokens=${completionTokens}) — sessionId=${sessionId}`
                     );
                   }
+                  // #5297-fix-midthought: When GLM 5.2 emits finish_reason="stop" with NO
+                  // tool_calls AND visible content trimmed with the trailing character
+                  // of `:`, `;`, `,`, whitespace, or `...` — clearly mid-thought text
+                  // that intended to be followed by a tool_call but the model dropped it
+                  // (e.g., "Remove the unused `mutedColor` since VoiceTitleInput handles its own:")
+                  // we synthesize the same bash-noop tool_call block as above. Without
+                  // this, opencode sees text + no tool_call + finish="stop" and treats
+                  // it as a final answer — terminating the agent loop mid-task.
+                  // Discovered investigating the 2026-07-20 20:39:14 UTC empty-stop
+                  // event in the Tendo session: GLM emitted 147 visible content tokens
+                  // of intended-edit-description ending in `:` and finished with `stop`
+                  // instead of `tool_calls`. The EMPTY `!passthroughAccumulatedContent.trim()`
+                  // branch above did NOT fire because `passthroughAccumulatedContent` was
+                  // non-empty mid-thought text.
+                  else if (
+                    isFinishChunk &&
+                    parsed.choices[0]?.finish_reason === "stop" &&
+                    !passthroughHasToolCalls &&
+                    passthroughAccumulatedContent.trim().length > 0 &&
+                    /[:;,]$|\.\.\.$|\s$/.test(passthroughAccumulatedContent.trim())
+                  ) {
+                    const synthToolCallId = `call_omni_cont_${Date.now()}`;
+                    const synthToolCallChunk = {
+                      id: passthroughResponsesId || `chatcmpl-${Date.now()}`,
+                      object: "chat.completion.chunk",
+                      created: Math.floor(Date.now() / 1000),
+                      model: model || "unknown",
+                      choices: [
+                        {
+                          index: 0,
+                          delta: {
+                            tool_calls: [
+                              {
+                                index: 0,
+                                id: synthToolCallId,
+                                type: "function",
+                                function: {
+                                  name: "bash",
+                                  arguments: '{"command":"true"}',
+                                },
+                              },
+                            ],
+                          },
+                          finish_reason: null,
+                        },
+                      ],
+                    };
+                    const synthOutput = `data: ${JSON.stringify(synthToolCallChunk)}\n\n`;
+                    reqLogger?.appendConvertedChunk?.(synthOutput);
+                    controller.enqueue(encoder.encode(synthOutput));
+                    // Bookkeeping so downstream code path is consistent with the synth
+                    passthroughHasToolCalls = true;
+                    passthroughToolCalls.set(synthToolCallId, {
+                      id: synthToolCallId,
+                      index: 0,
+                      type: "function",
+                      function: {
+                        name: "bash",
+                        arguments: '{"command":"true"}',
+                      },
+                    });
+                    // Force finish_reason to "tool_calls" on the upstream finish chunk
+                    parsed.choices[0].finish_reason = "tool_calls";
+                    // Make sure the modified chunk is re-serialized
+                    output = `data: ${JSON.stringify(parsed)}\n\n`;
+                    injectedUsage = true;
+                    console.warn(
+                      `[STREAM] Synthesized bash noop tool_call for mid-thought stop (${provider || "provider"}:${model || "unknown"}, content_len=${passthroughAccumulatedContent.length}) — sessionId=${sessionId}`
+                    );
+                  }
 
                   // T18: Normalize finish_reason to 'tool_calls' if tool calls were used
                   if (
