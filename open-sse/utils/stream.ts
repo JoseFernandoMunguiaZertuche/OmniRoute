@@ -1860,12 +1860,21 @@ export function createSSEStream(options: StreamOptions = {}) {
                   // avoids the "Maximum steps reached" / mid-task termination cycle.
                   // Caveat: opencode's bash permission is "ask" by default; if the user
                   // denies, `experimental.continue_loop_on_deny: true` keeps the loop alive.
+                  //
+                  // NOTE: We intentionally allow passthroughAccumulatedReasoning to be
+                  // non-empty here. GLM 5.2 on NVIDIA NIM often emits the bulk of its
+                  // completion_tokens as reasoning_content (internal "thinking") with ZERO
+                  // visible content. opencode treats this exactly like an empty stop —
+                  // the reasoning is shown to the user but no assistant turn is committed
+                  // (no content + no tool_calls => agent loop terminates). Synthesizing
+                  // a no-op tool_call regardless of reasoning presence forces the loop to
+                  // continue: opencode runs `bash true`, observes empty output, and
+                  // sends another turn.
                   if (
                     isFinishChunk &&
                     parsed.choices[0]?.finish_reason === "stop" &&
                     !passthroughHasToolCalls &&
-                    !passthroughAccumulatedContent.trim() &&
-                    !passthroughAccumulatedReasoning.trim()
+                    !passthroughAccumulatedContent.trim()
                   ) {
                     const synthToolCallId = `call_omni_cont_${Date.now()}`;
                     const synthToolCallChunk = {
