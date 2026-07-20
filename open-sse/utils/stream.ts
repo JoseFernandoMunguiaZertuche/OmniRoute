@@ -1849,6 +1849,76 @@ export function createSSEStream(options: StreamOptions = {}) {
                     } catch {}
                   }
 
+                  // #5297-fix: GLM 5.2 on NVIDIA NIM emits finish_reason="stop" with
+                  // completion_tokens=300-3000 but ZERO visible content (the tokens are
+                  // consumed by internal "thinking" — we see them in usage but not in the
+                  // visible message). opencode sees null content + finish=stop and treats
+                  // it as a terminal stop, killing the agent loop. To keep opencode's loop
+                  // alive, we synthesize a no-op "bash true" tool_call chunk + force
+                  // finish_reason="tool_calls" so opencode will execute the no-op tool,
+                  // observe the empty output, and send another turn to the model — which
+                  // avoids the "Maximum steps reached" / mid-task termination cycle.
+                  // Caveat: opencode's bash permission is "ask" by default; if the user
+                  // denies, `experimental.continue_loop_on_deny: true` keeps the loop alive.
+                  if (
+                    isFinishChunk &&
+                    parsed.choices[0]?.finish_reason === "stop" &&
+                    !passthroughHasToolCalls &&
+                    !passthroughAccumulatedContent.trim() &&
+                    !passthroughAccumulatedReasoning.trim()
+                  ) {
+                    const synthToolCallId = `call_omni_cont_${Date.now()}`;
+                    const synthToolCallChunk = {
+                      id: passthroughResponsesId || `chatcmpl-${Date.now()}`,
+                      object: "chat.completion.chunk",
+                      created: Math.floor(Date.now() / 1000),
+                      model: model || "unknown",
+                      choices: [
+                        {
+                          index: 0,
+                          delta: {
+                            tool_calls: [
+                              {
+                                index: 0,
+                                id: synthToolCallId,
+                                type: "function",
+                                function: {
+                                  name: "bash",
+                                  arguments: '{"command":"true"}',
+                                },
+                              },
+                            ],
+                          },
+                          finish_reason: null,
+                        },
+                      ],
+                    };
+                    const synthOutput = `data: ${JSON.stringify(synthToolCallChunk)}\n\n`;
+                    reqLogger?.appendConvertedChunk?.(synthOutput);
+                    controller.enqueue(encoder.encode(synthOutput));
+                    // Bookkeeping so downstream code path is consistent with the synth
+                    passthroughHasToolCalls = true;
+                    passthroughToolCalls.set(synthToolCallId, {
+                      id: synthToolCallId,
+                      index: 0,
+                      type: "function",
+                      function: {
+                        name: "bash",
+                        arguments: '{"command":"true"}',
+                      },
+                    });
+                    // Force finish_reason to "tool_calls" on the upstream finish chunk
+                    parsed.choices[0].finish_reason = "tool_calls";
+                    // Make sure the modified chunk is re-serialized
+                    output = `data: ${JSON.stringify(parsed)}\n\n`;
+                    injectedUsage = true;
+                    const u = usage as Record<string, unknown> | null;
+                    const completionTokens = Number(u?.completion_tokens ?? u?.output_tokens ?? 0);
+                    console.warn(
+                      `[STREAM] Synthesized bash noop tool_call for empty stop (${provider || "provider"}:${model || "unknown"}, completion_tokens=${completionTokens}) — sessionId=${sessionId}`
+                    );
+                  }
+
                   // T18: Normalize finish_reason to 'tool_calls' if tool calls were used
                   if (
                     isFinishChunk &&
@@ -2419,30 +2489,36 @@ export function createSSEStream(options: StreamOptions = {}) {
                 //   - no reasoning accumulated
                 //   - no tool_calls (otherwise opencode would run them)
                 //   - completion_tokens < 100 (avoids false-positives on legit short replies)
+                //
+                // IMPORTANT: `reasoning` must be defined here BEFORE the isTrulyEmpty check.
+                // Earlier versions of this patch referenced `reasoning.trim()` before `reasoning`
+                // was declared (TDZ → ReferenceError → silent catch → patch never fired).
+                // Hoisting the const declaration fixes this.
+                const reasoning = passthroughAccumulatedReasoning.trim();
                 const isTrulyEmpty =
                   !content.trim() && !reasoning.trim() && passthroughToolCalls.size === 0;
                 if (isTrulyEmpty) {
-                  // Pick the synthesized placeholder based on completion_tokens:
-                  //   0: empty placeholder (model emitted nothing — likely just a finish marker)
-                  //   >0: model emitted meta-tokens (could be a thinking artifact)
+                  // Synthesize placeholder ALWAYS (don't gate on completion_tokens).
+                  // GLM 5.2 on NVIDIA NIM emits finish_reason="stop" with completion_tokens=300-3000
+                  // but ZERO visible content (the tokens are consumed by internal "thinking" —
+                  // we see them in usage but not in the visible message). opencode sees
+                  // null content + finish=stop and treats it as a terminal stop, killing the agent.
+                  // Synthesizing a non-empty placeholder keeps opencode's agent loop alive.
                   const completion = Number(
                     (usage as Record<string, unknown> | null)?.completion_tokens ??
                       (usage as Record<string, unknown> | null)?.output_tokens ??
                       0
                   );
-                  if (completion < 100) {
-                    content =
-                      "[Model returned an empty response — please continue with the next steps or call a tool]";
-                    console.warn(
-                      `[STREAM] Synthesized content for empty response (${provider || "provider"}:${model || "unknown"}, completion_tokens=${completion}) — sessionId=${sessionId}`
-                    );
-                  }
+                  content =
+                    "[Model returned an empty response — please continue with the next steps or call a tool]";
+                  console.warn(
+                    `[STREAM] Synthesized content for empty response (${provider || "provider"}:${model || "unknown"}, completion_tokens=${completion}) — sessionId=${sessionId}`
+                  );
                 }
                 const message: Record<string, unknown> = {
                   role: "assistant",
                   content: content || null,
                 };
-                const reasoning = passthroughAccumulatedReasoning.trim();
                 if (reasoning) {
                   message.reasoning_content = reasoning;
                 }
@@ -2697,19 +2773,19 @@ export function createSSEStream(options: StreamOptions = {}) {
               }
               // #5297 fix: detect truly-empty responses and synthesize non-empty content
               // (same logic as passthrough path — see comment there)
+              // NOTE: Don't gate on completion_tokens — empty responses can have high
+              // completion_tokens when the model "thinks" internally but emits no visible content.
               if (!content.trim() && normalizedToolCalls.length === 0) {
                 const translateCompletion = Number(
                   (state?.usage as Record<string, unknown> | null)?.completion_tokens ??
                     (state?.usage as Record<string, unknown> | null)?.output_tokens ??
                     0
                 );
-                if (translateCompletion < 100) {
-                  content =
-                    "[Model returned an empty response — please continue with the next steps or call a tool]";
-                  console.warn(
-                    `[STREAM] Synthesized content for empty translate response (${provider || "provider"}:${model || "unknown"}, completion_tokens=${translateCompletion}) — sessionId=${sessionId}`
-                  );
-                }
+                content =
+                  "[Model returned an empty response — please continue with the next steps or call a tool]";
+                console.warn(
+                  `[STREAM] Synthesized content for empty translate response (${provider || "provider"}:${model || "unknown"}, completion_tokens=${translateCompletion}) — sessionId=${sessionId}`
+                );
               }
               const message: Record<string, unknown> = {
                 role: "assistant",
