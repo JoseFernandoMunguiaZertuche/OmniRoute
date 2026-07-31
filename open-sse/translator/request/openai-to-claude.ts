@@ -1,7 +1,7 @@
 import { register } from "../registry.ts";
 import { FORMATS } from "../formats.ts";
 // CLAUDE_SYSTEM_PROMPT import removed — no longer injected unconditionally (#1966/#2130)
-import { supportsClaudeMaxEffort, supportsXHighEffort } from "../../config/providerModels.ts";
+import { supportsClaudeMaxEffort } from "../../config/providerModels.ts";
 import { adjustMaxTokens } from "../helpers/maxTokensHelper.ts";
 import { sanitizeToolId } from "../helpers/schemaCoercion.ts";
 import { safeParseJSON } from "../helpers/jsonUtil.ts";
@@ -185,7 +185,7 @@ export function openaiToClaudeRequest(model, body, stream) {
     const normalizedEffort =
       requestedEffort === "max" && !supportsClaudeMaxEffort(model)
         ? "high"
-        : requestedEffort === "xhigh" && !supportsXHighEffort("claude", model)
+        : requestedEffort === "xhigh" && !supportsClaudeMaxEffort(model)
           ? "high"
           : requestedEffort;
     if (isAdaptiveThinkingOnly(model)) {
@@ -622,7 +622,12 @@ function getContentBlocksFromMessage(
       (b) => b.type === "thinking" || b.type === "redacted_thinking"
     );
     const hasToolUseBlock = blocks.some((b) => b.type === "tool_use");
-    if (msg.reasoning_content && thinkingEnabledForRequest && hasToolUseBlock && !hasThinkingBlock) {
+    if (
+      msg.reasoning_content &&
+      thinkingEnabledForRequest &&
+      hasToolUseBlock &&
+      !hasThinkingBlock
+    ) {
       blocks.unshift({
         type: "redacted_thinking",
         data: DEFAULT_THINKING_CLAUDE_SIGNATURE,

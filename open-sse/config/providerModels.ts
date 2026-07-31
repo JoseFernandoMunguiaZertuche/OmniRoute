@@ -74,7 +74,16 @@ export function getModelsByProviderId(providerId: string): RegistryModel[] {
 }
 
 const CLAUDE_MODEL_PATTERN = /(?:^|[\/._-])claude(?:[._-]|$)/;
-const CLAUDE_MAX_EFFORT_UNSUPPORTED_FAMILY_PATTERNS = [/(?:^|[\/._-])haiku(?:[._-]|$)/] as const;
+// #lumosel-fallback: LumosEL's Opus 5 deployment rejects `reasoning_effort=max` —
+// the gateway is provisioned behind an Anthropic Messages API that 502s on the
+// adaptive+max effort combo. Downgrading `max → high` here keeps Opus 5 within
+// the upstream's accept set while leaving all other Claude models (incl. NVIDIA's
+// GLM 5.2 path, which is named z-ai/glm-5.2 and never matches CLAUDE_MODEL_PATTERN)
+// entirely unaffected. Haiku remains in the list for the original 4.7 reject.
+const CLAUDE_MAX_EFFORT_UNSUPPORTED_FAMILY_PATTERNS = [
+  /(?:^|[\/._-])haiku(?:[._-]|$)/,
+  /(?:^|[\/._-])opus(?:[._-])*5(?:[._-]|$)/,
+] as const;
 const ANTHROPIC_COMPATIBLE_PREFIX = "anthropic-compatible-";
 
 export function supportsClaudeMaxEffort(modelId: string | null | undefined): boolean {
