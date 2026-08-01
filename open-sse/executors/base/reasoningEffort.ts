@@ -56,7 +56,14 @@ export function supportsMaxEffortForProvider(provider: string, model: string): b
     (provider === "opencode-go" || provider === "opencode-zen") &&
     model.toLowerCase().includes("deepseek");
   const isOllamaCloud = provider === "ollama-cloud";
-  return isClaude || isOpencodeGoDeepSeek || isOllamaCloud;
+  // NVIDIA NIM hosts GLM-5.2 with the native Z.ai enum, where max is the
+  // default/recommended deep-reasoning tier. Verified 2026-07-31:
+  // integrate.api.nvidia.com/v1/chat/completions accepts reasoning_effort=max
+  // on z-ai/glm-5.2 (HTTP 200). Without this opt-in, max would be rewritten to
+  // xhigh — equivalent per Z.ai docs (xhigh maps to max) but we send the
+  // literal documented top-tier value instead.
+  const isNvidiaGlm52 = provider === "nvidia" && /^z-ai\/glm-5\.2$/i.test(model);
+  return isClaude || isOpencodeGoDeepSeek || isOllamaCloud || isNvidiaGlm52;
 }
 
 export function sanitizeReasoningEffortForProvider(
