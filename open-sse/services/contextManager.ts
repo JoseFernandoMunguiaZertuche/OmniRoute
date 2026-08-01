@@ -18,7 +18,8 @@ const DEFAULT_LIMITS: Record<string, number> = {
 };
 
 // Environment variable overrides (highest priority)
-function getEnvOverride(provider: string): number | null {
+function getEnvOverride(provider: string | null | undefined): number | null {
+  if (!provider || typeof provider !== "string") return null;
   const envKey = `CONTEXT_LENGTH_${provider.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`;
   const envValue = process.env[envKey];
   if (envValue) {
@@ -60,7 +61,11 @@ export function estimateTokens(text: string | object | null | undefined): number
  * Get token limit for a provider/model combination
  * Priority: Env override > models.dev DB > Registry defaultContextLength > DEFAULT_LIMITS
  */
-export function getTokenLimit(provider: string, model: string | null = null): number {
+export function getTokenLimit(
+  provider: string | null | undefined,
+  model: string | null = null
+): number {
+  if (!provider || typeof provider !== "string") return DEFAULT_LIMITS.default;
   return resolveTokenLimit(provider, model).limit;
 }
 
@@ -71,9 +76,13 @@ export function getTokenLimit(provider: string, model: string | null = null): nu
  * catch-all default.
  */
 function resolveTokenLimit(
-  provider: string,
+  provider: string | null | undefined,
   model: string | null = null
 ): { limit: number; specific: boolean } {
+  if (!provider || typeof provider !== "string") {
+    return { limit: DEFAULT_LIMITS.default, specific: false };
+  }
+
   // 1. Check environment variable override first
   const envOverride = getEnvOverride(provider);
   if (envOverride) return { limit: envOverride, specific: true };
@@ -125,7 +134,7 @@ function resolveTokenLimit(
  * case where the current provider/model resolves no specific limit at all.
  */
 export function resolveComboContextLimit(options: {
-  provider: string;
+  provider: string | null | undefined;
   model: string | null;
   comboTargetLimits: number[];
 }): { limit: number; source: "target" | "combo-min" | "fallback" } {

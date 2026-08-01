@@ -93,13 +93,31 @@ export function applyComboTargetExhaustion(
     (isProviderExhaustedReason(fallbackResult) ||
       classifyErrorText(structuredError?.code || errorText) === RateLimitReason.QUOTA_EXHAUSTED ||
       allAccountsRateLimited);
-  if (providerExhausted) {
+
+  // When the target was pinned to a specific connectionId (combo/dispatcher chose one account
+  // out of many for this provider), the quota-exhausted signal only attests to THAT account.
+  // Sibling connections under the same provider have independent quotas and must remain
+  // eligible — otherwise a multi-account combo collapses to "first CF fails → all CF skip →
+  // fall through to NVIDIA", wasting the other healthy accounts.
+  const connectionBound = typeof target.connectionId === "string" && target.connectionId.length > 0;
+  const downgradeToConnectionExhaustion = providerExhausted && connectionBound;
+
+  if (providerExhausted && !downgradeToConnectionExhaustion) {
     exhaustedProviders.add(provider);
     const emit = exhaustedLogLevel === "debug" ? log.debug : log.info;
     emit?.(
       tag,
       `Provider ${provider} quota exhausted — marking for skip on remaining targets (#1731)`
     );
+  } else if (downgradeToConnectionExhaustion) {
+    exhaustedConnections.add(`${provider}:${target.connectionId}`);
+    log.debug?.(
+      tag,
+      `Connection ${(target.connectionId as string).slice(0, 8)} quota exhausted (provider ${provider} retained — sibling connections have independent quotas) (#1731v3)`
+    );
+    if (result.status === 429 && !isTokenLimitBreach && provider && provider !== "unknown") {
+      transientRateLimitedProviders.add(provider);
+    }
   } else {
     if (result.status === 429 && !isTokenLimitBreach && provider && provider !== "unknown") {
       transientRateLimitedProviders.add(provider);
@@ -107,7 +125,7 @@ export function applyComboTargetExhaustion(
     markConnectionLevelExhaustion(target, { result, errorText, sets, log, tag, rawModel });
   }
 
-  return providerExhausted;
+  return providerExhausted && !downgradeToConnectionExhaustion;
 }
 
 /**

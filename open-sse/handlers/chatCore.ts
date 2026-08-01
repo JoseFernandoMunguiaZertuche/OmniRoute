@@ -1495,6 +1495,27 @@ export async function handleChatCore({
     if (isCombo && comboName) {
       log?.info?.("CONTEXT", `Attempting to resolve combo limits for comboName=${comboName}`);
       try {
+        const _om = process.env.OPENCODE_MONITOR;
+        if (_om || comboName === "glm-5.2-nvidia-only") {
+          const _msgs = body?.messages;
+          const _firstLast = _msgs?.[_msgs.length - 1]?.content;
+          const _fl = Array.isArray(_firstLast)
+            ? _firstLast.map((p) => p?.text || "").join(" ")
+            : String(_firstLast || "");
+          const _sys = _msgs?.[0]?.content;
+          const _sl = Array.isArray(_sys)
+            ? _sys
+                .map((p) => p?.text || "")
+                .join(" ")
+                .slice(0, 80)
+            : String(_sys || "").slice(0, 80);
+          log?.info?.(
+            "REQ",
+            `glm-5.2 [MON] msgs=${_msgs?.length} lastText=${_fl.slice(0, 80)} sys=${_sl} hasTools=${Array.isArray(body?.tools)} reasoning=${body?.reasoning_effort || "none"} stream=${body?.stream} maxT=${body?.max_tokens} stopReason=${body?.stop_reason || "none"} ${body?.reasoning_effort_verbosity || ""}`
+          );
+        }
+      } catch (_e) {}
+      try {
         const { getComboByName } = await import("../../src/lib/localDb");
         const { parseModel } = await import("../services/model.ts");
         const { resolveComboTargets } = await import("../services/combo.ts");

@@ -70,6 +70,14 @@ function cooldownKey(provider: string, connectionId?: string): string {
 /**
  * Record a failure for a provider/connection.
  *
+ * PATCHED 2026-07-14: Added `firstFailureAt` (set once, never refreshed) so
+ * consecutive failures do NOT extend the cooldown window indefinitely. The
+ * combo loop previously kept refreshing `lastFailureAt` every iteration, so a
+ * continuously-failing connection would NEVER exit cooldown — causing the
+ * entire provider to be permanently locked out for the full `maxRetryCooldownMs`
+ * (default 10 minutes) per connection. With this fix, the cooldown is bounded
+ * by the time since the FIRST failure in the current escalation cycle.
+ *
  * @param provider - Provider ID (e.g. "openai", "anthropic")
  * @param connectionId - Optional connection ID for per-connection tracking
  * @param settings - Resilience settings for cooldown configuration
@@ -87,8 +95,34 @@ export function recordProviderCooldown(
   const retentionMs = getEntryRetentionMs(settings);
 
   if (existing) {
-    existing.lastFailureAt = now;
-    existing.failureCount++;
+    // PATCHED 2026-07-14: only update lastFailureAt when the entry is in its
+    // initial escalation. Once the cooldown has saturated at maxRetryCooldownMs,
+    // treat subsequent failures as the same "episode" and stop refreshing the
+    // timer — otherwise the combo loop traps the connection in permanent
+    // cooldown (every iteration re-fails and re-extends the window).
+    const saturated = existing.failureCount >= 10;
+    if (!saturated) {
+      existing.lastFailureAt = now;
+      existing.failureCount++;
+    } else {
+      // Already at max escalation. Only refresh if the cooldown has actually
+      // expired (no longer in cooldown window) — that means the connection
+      // recovered briefly, then failed again, which IS a new episode.
+      const minCooldownMs =
+        settings?.providerCooldown?.minRetryCooldownMs ??
+        DEFAULT_RESILIENCE_SETTINGS.providerCooldown.minRetryCooldownMs;
+      const maxCooldownMs =
+        settings?.providerCooldown?.maxRetryCooldownMs ??
+        DEFAULT_RESILIENCE_SETTINGS.providerCooldown.maxRetryCooldownMs;
+      const elapsed = now - existing.lastFailureAt;
+      const scaledCooldownMs = Math.min(minCooldownMs * Math.pow(2, 9), maxCooldownMs);
+      if (elapsed >= scaledCooldownMs) {
+        // Cooldown expired — fresh episode
+        existing.lastFailureAt = now;
+        existing.failureCount = 1;
+      }
+      // Else: still in cooldown window, don't refresh — let it expire
+    }
     existing.retentionMs = Math.max(existing.retentionMs, retentionMs);
   } else {
     cooldownMap.set(key, { lastFailureAt: now, failureCount: 1, retentionMs });

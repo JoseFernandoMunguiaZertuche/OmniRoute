@@ -18,7 +18,7 @@ export const zaiProvider: RegistryEntry = {
   // would reach z.ai's Anthropic endpoint as unknown IDs. Use the `glm` provider
   // for effort tiers. Vision models are likewise omitted (handled elsewhere).
   models: [
-    { id: "glm-5.2", name: "GLM 5.2" },
+    { id: "glm-5.2", name: "GLM 5.2", supportsVision: false, strip: ["image"] },
     { id: "glm-5.1", name: "GLM 5.1" },
     { id: "glm-5", name: "GLM 5" },
     { id: "glm-5-turbo", name: "GLM 5 Turbo" },

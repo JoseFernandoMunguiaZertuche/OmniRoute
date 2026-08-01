@@ -16,6 +16,47 @@ function shouldStripPart(part: JsonRecord, stripTypes: Set<string>): boolean {
   return false;
 }
 
+const DIRECTIVE_PLACEHOLDER = {
+  type: "text",
+  text:
+    "[Image omitted — this model cannot read images. Do not retry with the same request; " +
+    "if image data is essential, ask the user for a textual description instead.]",
+};
+
+function filterContentArray(
+  content: unknown[],
+  stripSet: Set<string>
+): { filtered: unknown[]; removedParts: number } {
+  let removedParts = 0;
+  const filtered: unknown[] = [];
+
+  for (const part of content) {
+    const partRecord = asRecord(part);
+
+    if (shouldStripPart(partRecord, stripSet)) {
+      removedParts += 1;
+      continue;
+    }
+
+    if (Array.isArray(partRecord.content)) {
+      const nested = filterContentArray(partRecord.content, stripSet);
+      removedParts += nested.removedParts;
+      if (nested.filtered.length === 0) {
+        filtered.push({ ...partRecord, content: [DIRECTIVE_PLACEHOLDER] });
+      } else if (nested.removedParts > 0) {
+        filtered.push({ ...partRecord, content: nested.filtered });
+      } else {
+        filtered.push(part);
+      }
+      continue;
+    }
+
+    filtered.push(part);
+  }
+
+  return { filtered, removedParts };
+}
+
 export function stripIncompatibleMessageContent(
   messages: unknown,
   stripTypes: readonly string[]
@@ -25,33 +66,27 @@ export function stripIncompatibleMessageContent(
   }
 
   const stripSet = new Set(stripTypes);
-  let removedParts = 0;
-
+  let totalRemoved = 0;
   const sanitizedMessages = messages.map((message) => {
     const record = asRecord(message);
     if (!Array.isArray(record.content)) {
       return message;
     }
 
-    const filteredContent = record.content.filter((part) => {
-      const shouldStrip = shouldStripPart(asRecord(part), stripSet);
-      if (shouldStrip) {
-        removedParts += 1;
-      }
-      return !shouldStrip;
-    });
+    const { filtered, removedParts } = filterContentArray(record.content, stripSet);
+    if (removedParts === 0) {
+      return message;
+    }
+    totalRemoved += removedParts;
 
-    if (filteredContent.length > 0) {
-      return { ...record, content: filteredContent };
+    if (filtered.length === 0) {
+      return { ...record, content: [DIRECTIVE_PLACEHOLDER] };
     }
 
-    return {
-      ...record,
-      content: [{ type: "text", text: "[unsupported image/audio content removed]" }],
-    };
+    return { ...record, content: filtered };
   });
 
-  return { messages: sanitizedMessages, removedParts };
+  return { messages: sanitizedMessages, removedParts: totalRemoved };
 }
 
 export function getStripTypesForProviderModel(providerId: string, modelId: string): string[] {

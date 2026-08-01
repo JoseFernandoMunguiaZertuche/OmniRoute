@@ -41,9 +41,9 @@ const baseOpts = {
   exhaustedLogLevel: "info" as const,
 };
 
-test("marks provider exhausted when the fallback result signals quota exhaustion", () => {
+test("marks provider exhausted when the fallback result signals quota exhaustion (no connectionId — legacy path)", () => {
   const s = sets();
-  const exhausted = applyComboTargetExhaustion(target(), {
+  const exhausted = applyComboTargetExhaustion(target({ connectionId: null }), {
     ...baseOpts,
     result: { status: 429 },
     fallbackResult: { creditsExhausted: true },
@@ -54,9 +54,9 @@ test("marks provider exhausted when the fallback result signals quota exhaustion
   assert.equal(s.transientRateLimitedProviders.size, 0);
 });
 
-test("round-robin's allAccountsRateLimited term also marks the provider exhausted", () => {
+test("round-robin's allAccountsRateLimited term also marks the provider exhausted (no connectionId — legacy path)", () => {
   const s = sets();
-  const exhausted = applyComboTargetExhaustion(target(), {
+  const exhausted = applyComboTargetExhaustion(target({ connectionId: null }), {
     ...baseOpts,
     result: { status: 503 },
     fallbackResult: {},
@@ -362,4 +362,93 @@ test("gemini 524 DOES exhaust connection (cloudflare timeout)", () => {
     sets: s,
   });
   assert.equal(s.exhaustedConnections.has("gemini:gemini-key-abc"), true);
+});
+
+// #1731v3: when a combo pre-forces a specific connectionId and that one connection's
+// quota is exhausted, the OTHER connections under the same provider must remain
+// eligible so the combo engine tries them in the same request. Otherwise a multi-
+// account combo collapses to "first CF fails → all CF skip → fall through to NVIDIA",
+// wasting every other healthy account.
+test("quota-exhausted on a connection-bound target only exhausts that connection (provider retained) (#1731v3)", () => {
+  const s = sets();
+  const exhausted = applyComboTargetExhaustion(
+    target({ provider: "cloudflare-ai", connectionId: "cf-account-05" }),
+    {
+      ...baseOpts,
+      result: { status: 429 },
+      fallbackResult: { dailyQuotaExhausted: true, reason: "quota_exhausted" },
+      errorText: "Daily quota exhausted — recovering in 6h",
+      sets: s,
+    }
+  );
+  assert.equal(
+    exhausted,
+    false,
+    "must not mark provider exhausted — siblings have independent quotas"
+  );
+  assert.equal(
+    s.exhaustedProviders.has("cloudflare-ai"),
+    false,
+    "must NOT add the provider to exhaustedProviders — sibling accounts should still be tried"
+  );
+  assert.ok(
+    s.exhaustedConnections.has("cloudflare-ai:cf-account-05"),
+    "must add the specific connection to exhaustedConnections"
+  );
+  assert.ok(
+    s.transientRateLimitedProviders.has("cloudflare-ai"),
+    "429 must still mark the provider as transient rate-limited"
+  );
+});
+
+test("quota-exhausted WITHOUT a connectionId still marks provider exhausted (backward compat)", () => {
+  const s = sets();
+  const exhausted = applyComboTargetExhaustion(
+    target({ provider: "cloudflare-ai", connectionId: null }),
+    {
+      ...baseOpts,
+      result: { status: 429 },
+      fallbackResult: { dailyQuotaExhausted: true },
+      errorText: "Daily quota exhausted",
+      sets: s,
+    }
+  );
+  assert.equal(exhausted, true, "no connectionId → provider-level exhaust (legacy path)");
+  assert.ok(s.exhaustedProviders.has("cloudflare-ai"));
+});
+
+test("creditsExhausted on a connection-bound target downgrades to connection-level only", () => {
+  const s = sets();
+  const exhausted = applyComboTargetExhaustion(
+    target({ provider: "openai", connectionId: "openai-key-1" }),
+    {
+      ...baseOpts,
+      result: { status: 429 },
+      fallbackResult: { creditsExhausted: true },
+      errorText: "insufficient credits",
+      sets: s,
+    }
+  );
+  assert.equal(exhausted, false);
+  assert.equal(s.exhaustedProviders.has("openai"), false);
+  assert.ok(s.exhaustedConnections.has("openai:openai-key-1"));
+  assert.ok(s.transientRateLimitedProviders.has("openai"));
+});
+
+test("allAccountsRateLimited (503 + body) on a connection-bound target downgrades", () => {
+  const s = sets();
+  const exhausted = applyComboTargetExhaustion(
+    target({ provider: "cloudflare-ai", connectionId: "cf-acc-2" }),
+    {
+      ...baseOpts,
+      result: { status: 503, headers: new Headers({ "content-type": "application/json" }) },
+      fallbackResult: {},
+      errorText: "Service temporarily unavailable",
+      allAccountsRateLimited: true,
+      sets: s,
+    }
+  );
+  assert.equal(exhausted, false);
+  assert.equal(s.exhaustedProviders.has("cloudflare-ai"), false);
+  assert.ok(s.exhaustedConnections.has("cloudflare-ai:cf-acc-2"));
 });

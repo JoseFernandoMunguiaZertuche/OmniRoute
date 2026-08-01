@@ -152,7 +152,7 @@ export const comboRuntimeConfigSchema = z
   .object({
     responseValidation: responseValidationSchema.optional(),
     strategy: comboStrategySchema.optional(),
-    maxRetries: z.coerce.number().int().min(0).max(10).optional(),
+    maxRetries: z.coerce.number().int().min(0).max(999999).optional(),
     retryDelayMs: z.coerce.number().int().min(0).max(60000).optional(),
     fallbackDelayMs: z.coerce.number().int().min(0).max(60000).optional(),
     timeoutMs: z.coerce.number().int().min(1000).optional(),
@@ -184,7 +184,7 @@ export const comboRuntimeConfigSchema = z
     reasoningTokenBufferEnabled: z.boolean().optional(),
     compressionMode: compressionModeSchema.optional(),
     failoverBeforeRetry: z.boolean().optional(),
-    maxSetRetries: z.coerce.number().int().min(0).max(10).optional(),
+    maxSetRetries: z.coerce.number().int().min(0).max(999999).optional(),
     setRetryDelayMs: z.coerce.number().int().min(0).max(60000).optional(),
     zeroLatencyOptimizationsEnabled: z.boolean().optional(),
     hedging: z.boolean().optional(),
@@ -279,7 +279,11 @@ export const createComboSchema = z.object({
   // the `dimensions` field (and translated to `outputDimensionality` for Gemini).
   // Stored as a string to match the OpenAI API convention; coerced to number
   // by the embedding handler. Leave unset to use each model's default.
-  dimensions: z.string().regex(/^\d+$/, "dimensions must be a positive integer string").optional().nullable(),
+  dimensions: z
+    .string()
+    .regex(/^\d+$/, "dimensions must be a positive integer string")
+    .optional()
+    .nullable(),
 });
 
 export const updateComboDefaultsSchema = z
@@ -329,7 +333,11 @@ export const updateComboSchema = z
     context_cache_protection: z.boolean().optional(),
     context_length: z.number().int().min(1000).max(2000000).optional().nullable(),
     compressionOverride: comboCompressionOverrideSchema.optional(),
-    dimensions: z.string().regex(/^\d+$/, "dimensions must be a positive integer string").optional().nullable(),
+    dimensions: z
+      .string()
+      .regex(/^\d+$/, "dimensions must be a positive integer string")
+      .optional()
+      .nullable(),
   })
   .superRefine((value, ctx) => {
     if (
