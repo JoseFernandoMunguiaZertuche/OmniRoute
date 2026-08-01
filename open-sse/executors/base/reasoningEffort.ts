@@ -48,10 +48,13 @@ export function supportsMaxEffortForProvider(provider: string, model: string): b
   // normalized to xhigh (the OmniRoute-internal top tier) and rejected by the
   // upstream. Scoped to opencode-go deliberately: OpenRouter's DeepSeek path
   // (pi#4055) is the documented inverse and expects xhigh, not max.
+  // opencode-zen's DeepSeek free tier accepts {high, max} literally as well
+  // (verified 2026-07-31: reasoning_effort=max returns 200 on deepseek-v4-flash-free).
   // Ollama Cloud also accepts literal max (for example GLM 5.2 supports
   // low|medium|high|max|none) and rejects xhigh.
   const isOpencodeGoDeepSeek =
-    provider === "opencode-go" && model.toLowerCase().includes("deepseek");
+    (provider === "opencode-go" || provider === "opencode-zen") &&
+    model.toLowerCase().includes("deepseek");
   const isOllamaCloud = provider === "ollama-cloud";
   return isClaude || isOpencodeGoDeepSeek || isOllamaCloud;
 }
