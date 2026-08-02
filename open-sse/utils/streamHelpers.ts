@@ -252,6 +252,18 @@ function hasOpenAICompatibleStreamValue(parsed: Record<string, unknown>): boolea
   return parsed.choices.some((choice) => {
     if (!isRecord(choice)) return false;
 
+    // A terminal choice (finish_reason set) is a recognized OpenAI-style chunk
+    // even when the delta is empty — the combo validator must enter the OpenAI
+    // branch for it so `ob` (hasOpenAIStopOrToolCalls) flips and the empty-stop
+    // / mid-thought checks fire. Without this, the final chunk
+    // `choices:[{delta:{role:"assistant"},finish_reason:"stop"}]` falls through
+    // to the Anthropic switch (where no case matches) and `ob` never sets,
+    // skipping the mid-thought check entirely (issue #5297 GLM "Reasons:"
+    // false-positive: the validator returned valid:true and forwarded the
+    // truncated response to the client, terminating the agent loop).
+    const finish = choice.finish_reason;
+    if (typeof finish === "string" && finish.length > 0) return true;
+
     const delta = isRecord(choice.delta) ? choice.delta : null;
     if (!delta) return false;
     if (typeof delta.content === "string" && delta.content.length > 0) return true;

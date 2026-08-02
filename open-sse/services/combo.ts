@@ -2957,6 +2957,17 @@ async function handleRoundRobinCombo({
   let globalAttempts = 0;
   let fallbackCount = 0;
   let recordedAttempts = 0;
+  // Quality-rejection tracking (independent from transient error tracking).
+  // When every attempted target returns 200 but fails our quality validator
+  // (mid-thought stop / empty stop with no content), that is a model-level
+  // behavior — NOT a transient upstream failure. Treating it like a 502 and
+  // recursing into handleRoundRobinCombo (the 2026-07-14 PATCHED block below)
+  // produces an infinite loop: every retried key fails the same way. User
+  // preference 2026-08-02: instead of looping forever, forward the LAST
+  // response as-is so the agent receives the (imperfect) completion and can
+  // continue the conversation, rather than hanging indefinitely.
+  let lastQualityResponse: Response | null = null;
+  let lastQualityReason: string | null = null;
 
   // #1731: Per-request in-memory set of providers whose quota is fully exhausted.
   // When a target returns a quota-exhausted 429, remaining targets from the same
@@ -3146,6 +3157,11 @@ async function handleRoundRobinCombo({
             `Empty response from ${modelStr} (${target.connectionId?.slice(0, 8) || "?"}) — reason=${quickReason}; skipping retries, falling over to next key`
           );
           result = attemptResult;
+          // Track this as a quality failure (not a transient upstream error):
+          // if every RR target ends here, the post-loop path forwards the last
+          // response instead of recursing indefinitely.
+          lastQualityResponse = attemptResult;
+          lastQualityReason = quickReason;
           break;
         }
 
@@ -3193,7 +3209,17 @@ async function handleRoundRobinCombo({
             // Fix #1707: Set terminal state so the fallback doesn't emit
             // misleading ALL_ACCOUNTS_INACTIVE when the real issue is quality.
             lastError = `Upstream response failed quality validation: ${quality.reason}`;
-            if (!lastStatus) lastStatus = 502;
+            // Track this as a quality failure (independent from transient
+            // upstream errors). Do NOT set lastStatus to 502 here — that
+            // would trip the 2026-07-14 "all targets exhausted" recursion
+            // block below into an infinite loop. Quality rejection is a
+            // model-level behavior (the upstream returned 200), not a 5xx
+            // transient: every retried key will fail the same way. User
+            // preference 2026-08-02: if all targets fail quality, forward
+            // the last response as-is rather than recursing forever.
+            lastQualityResponse = result;
+            lastQualityReason = quality.reason || "quality_rejected";
+            if (!lastStatus) lastStatus = null; // explicit: leave lastStatus null
             if (offset > 0) fallbackCount++;
             break; // move to next model
           }
@@ -3577,6 +3603,35 @@ async function handleRoundRobinCombo({
       fallbackCount,
       strategy: "round-robin",
     });
+  }
+
+  // Quality-exhaustion terminal path (2026-08-02): every target returned 200 but
+  // failed our quality validator (mid-thought / empty stop). This is NOT a
+  // transient error — the upstream is healthy, the model just emits truncated
+  // completions for this prompt. Recursing into handleRoundRobinCombo (the
+  // 2026-07-14 PATCHED block below) would loop forever hammering every key on
+  // the same prompt and never produce a useful answer. User preference:
+  // forward the LAST response to the client so the agent receives the
+  // (imperfect) completion and decides what to do, instead of hanging.
+  if (
+    !lastStatus && // no transient 4xx/5xx ever seen — every attempt was a 200 that failed quality
+    lastQualityResponse &&
+    lastQualityResponse.ok &&
+    lastQualityReason
+  ) {
+    log.warn(
+      "COMBO-RR",
+      `All ${recordedAttempts} attempt(s) failed quality check (${lastQualityReason}) — forwarding last response as-is (no transient error to wait out)`
+    );
+    // Clear the exhaustion timer since we're returning, not recursing.
+    (combo as unknown as Record<string, unknown>).__exhaustedStartMs = undefined;
+    recordComboRequest(combo.name, null, {
+      success: true,
+      latencyMs: Date.now() - startTime,
+      fallbackCount,
+      strategy: "round-robin",
+    });
+    return lastQualityResponse;
   }
 
   if (!lastStatus || lastStatus === 429 || (typeof lastStatus === "number" && lastStatus >= 500)) {
