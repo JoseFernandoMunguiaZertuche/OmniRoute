@@ -259,11 +259,37 @@ export async function validateResponseQuality(
             hasMessageStart = true;
             break;
           case "content_block_start":
-          case "content_block_delta":
           case "content_block_stop":
             hasContentBlock = true;
-            // Signal caller to stop buffering immediately.
-            return true;
+            // Do NOT return true here (and do not stop buffering): Anthropic-
+            // style streams (e.g. DeepSeek via opencode-zen) must also be
+            // peeked to end-of-stream so the terminal-finish checks below
+            // (empty stop, mid-thought stop) can run. Returning true on the
+            // first content block made those checks dead code for the DeepSeek
+            // fallback — a `Reasons:` mid-thought stop was forwarded as-is and
+            // opencode terminated the agent loop. Buffering the (usually
+            // short) stream costs latency but guarantees the combo
+            // skips+failovers to the next key instead of terminating.
+            break;
+          case "content_block_delta": {
+            hasContentBlock = true;
+            // Anthropic-style text accumulation (delta.text) — mirrors the
+            // OpenAI delta.content accumulation above so mid-thought detection
+            // works for Anthropic-format streams (DeepSeek via opencode-zen).
+            const delta = parsed.delta as Record<string, unknown> | undefined;
+            const deltaText = delta?.text;
+            if (typeof deltaText === "string" && deltaText.length > 0) {
+              anyContentFound = true;
+              openAIContentText += deltaText;
+            }
+            // A content_block_delta of type tool_use also means a real tool
+            // call is on the wire — a terminal stop after it is not mid-thought.
+            if (delta?.type === "tool_use") {
+              anyContentFound = true;
+              openAIToolCallsFound = true;
+            }
+            break;
+          }
           case "message_stop":
             hasLifecycleEnd = true;
             break;
@@ -344,6 +370,13 @@ export async function validateResponseQuality(
             return { valid: false, reason: "streaming empty content block" };
           }
 
+          // Combined "stream terminated" flag — works for both OpenAI-style
+          // (final choice has finish_reason) and Anthropic-style (message_start
+          // + message_stop with content_block) streams so the empty-stop and
+          // mid-thought checks below catch GLM AND DeepSeek (and similar) lines,
+          // not just OpenAI-shape responses.
+          const terminated = hasOpenAIStopOrToolCalls || (hasMessageStart && hasLifecycleEnd);
+
           // #5297 — OpenAI-style streaming: the stream reached a terminal
           // finish_reason ("stop" or "tool_calls") but emitted NO content and
           // NO tool_calls on the wire. This is the signature pattern of GLM 5.2
@@ -359,14 +392,10 @@ export async function validateResponseQuality(
           // (e.g. a 12-token "ok") by requiring completion_tokens >= 50 OR
           // reasoning deltas — if usage confirms the model emitted meaningful
           // tokens WITH content, anyContentFound is true anyway.
-          if (
-            !anyContentFound &&
-            hasOpenAIStopOrToolCalls &&
-            (openAICompletionTokens < 100 || sawReasoning)
-          ) {
+          if (!anyContentFound && terminated && (openAICompletionTokens < 100 || sawReasoning)) {
             log.warn?.(
               "COMBO",
-              `Streaming OpenAI-style response has terminal finish_reason but no content/tool_calls on the wire (completion_tokens=${openAICompletionTokens}, reasoning_only=${sawReasoning}) — marking as invalid for combo retry`
+              `Streaming response has terminal finish but no content/tool_calls on the wire (completion_tokens=${openAICompletionTokens}, reasoning_only=${sawReasoning}) — marking as invalid for combo retry`
             );
             return { valid: false, reason: "streaming empty stop with no content" };
           }
@@ -384,13 +413,13 @@ export async function validateResponseQuality(
             openAIContentText.length > 0 &&
             openAIContentText.trim().length > 0 &&
             !openAIToolCallsFound &&
-            hasOpenAIStopOrToolCalls &&
+            terminated &&
             /[;:,]$|\.\.\.$/.test(openAIContentText.trim())
           ) {
             const tail = openAIContentText.trim().slice(-12);
             log.warn?.(
               "COMBO",
-              `Streaming OpenAI-style response ended mid-thought (finish with no tool_calls, last chars=${JSON.stringify(tail)}) — marking as invalid for combo retry`
+              `Streaming response ended mid-thought (finish with no tool_calls, last chars=${JSON.stringify(tail)}) — marking as invalid for combo retry`
             );
             return { valid: false, reason: "streaming mid-thought stop" };
           }
