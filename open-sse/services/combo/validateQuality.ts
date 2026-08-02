@@ -137,6 +137,18 @@ export async function validateResponseQuality(
     // because we only watched the Claude content_block_* lifecycle.
     let hasOpenAIChoice = false;
     let hasOpenAIStopOrToolCalls = false;
+    // Reasoning deltas are NOT wire content: GLM 5.2 with max effort emits long
+    // `reasoning_content` but zero content/tool_calls and then finishes with
+    // `stop` — a dead-end turn for the agent. Track it separately so
+    // reasoning-only responses are flagged invalid for the combo empty-retry.
+    let sawReasoning = false;
+    // Mid-thought detection: GLM 5.2 sometimes emits real content that ends
+    // mid-sentence (trailing `:`/`;`/`...`) and then `finish_reason: stop` —
+    // the stream-layer MIDTHOUGHT synth would inject a `true` keep-alive in
+    // that case; instead we flag it invalid here so the combo skips+failovers
+    // to the next key (DeepSeek usually returns a complete answer).
+    let openAIContentText = "";
+    let openAIToolCallsFound = false;
     let openAICompletionTokens = 0;
     let openAIReasoningTokens = 0;
     const sseLineNormalizer = createSSEDataLineNormalizer();
@@ -197,16 +209,19 @@ export async function validateResponseQuality(
               const finish = c.finish_reason as string | null | undefined;
               if (Array.isArray(delta?.tool_calls) && (delta.tool_calls as unknown[]).length > 0) {
                 anyContentFound = true;
+                openAIToolCallsFound = true;
               }
               const deltaContent = delta?.content;
               if (typeof deltaContent === "string" && deltaContent.length > 0) {
                 anyContentFound = true;
+                openAIContentText += deltaContent;
               }
               const deltaReasoning =
                 (delta?.reasoning_content as string | undefined) ??
                 (delta?.reasoning as string | undefined);
               if (typeof deltaReasoning === "string" && deltaReasoning.length > 0) {
-                anyContentFound = true;
+                // Deliberately NOT anyContentFound — see sawReasoning declaration.
+                sawReasoning = true;
               }
               if (finish === "stop" || finish === "tool_calls" || finish === "length") {
                 hasOpenAIStopOrToolCalls = true;
@@ -229,7 +244,14 @@ export async function validateResponseQuality(
               openAIReasoningTokens = Number(u.reasoning_tokens ?? u.reasoningTokens ?? 0) || 0;
             }
           }
-          return true;
+          // Do NOT return true here: OpenAI-style streams must be peeked through
+          // to end-of-stream so the terminal-finish checks below (empty stop,
+          // mid-thought stop) can run. Returning true on the first chunk made
+          // those checks dead code — the stream-layer MIDTHOUGHT/EMPTY synth
+          // would then inject a `{"command":"true"}` keep-alive into the agent
+          // context. Buffering the (usually short) OpenAI stream costs latency
+          // but guarantees the combo skips+failovers instead of polluting.
+          return false;
         }
 
         switch (eventType) {
@@ -323,29 +345,54 @@ export async function validateResponseQuality(
           }
 
           // #5297 — OpenAI-style streaming: the stream reached a terminal
-          // finish_reason ("stop" or "tool_calls") but emitted NO content,
-          // NO tool_calls, and NO reasoning on any delta. This is the
-          // signature pattern of GLM 5.2 (and similar models) returning an
-          // empty assistant turn — it tells the agent "I'm done" with nothing
-          // to say, which causes opencode to terminate the loop prematurely.
-          // Mark as invalid so combo.ts falls through to the next target
-          // (or the per-target retry logic in handleSingleModel retries).
+          // finish_reason ("stop" or "tool_calls") but emitted NO content and
+          // NO tool_calls on the wire. This is the signature pattern of GLM 5.2
+          // (and similar models) returning an empty assistant turn — the model
+          // "thinks" (reasoning_content deltas, possibly thousands of tokens)
+          // and then tells the agent "I'm done" with nothing to say, which
+          // causes opencode to terminate the loop prematurely. Reasoning deltas
+          // are deliberately NOT counted as wire content (sawReasoning), so a
+          // reasoning-only terminal stop is flagged invalid here and the
+          // per-target retry logic in combo.ts retries internally — the client
+          // never sees the empty turn and no synthesized tool call is needed.
           // Guard against false positives on legitimately-tiny responses
           // (e.g. a 12-token "ok") by requiring completion_tokens >= 50 OR
-          // any reasoning_tokens > 0 — if usage confirms the model emitted
-          // meaningful tokens, the response is real even if no content
-          // reached the wire (rare but possible during thinking-heavy runs).
+          // reasoning deltas — if usage confirms the model emitted meaningful
+          // tokens WITH content, anyContentFound is true anyway.
           if (
             !anyContentFound &&
             hasOpenAIStopOrToolCalls &&
-            openAICompletionTokens < 100 &&
-            openAIReasoningTokens === 0
+            (openAICompletionTokens < 100 || sawReasoning)
           ) {
             log.warn?.(
               "COMBO",
-              `Streaming OpenAI-style response has terminal finish_reason but zero content/tool_calls/reasoning (completion_tokens=${openAICompletionTokens}) — marking as invalid for combo retry`
+              `Streaming OpenAI-style response has terminal finish_reason but no content/tool_calls on the wire (completion_tokens=${openAICompletionTokens}, reasoning_only=${sawReasoning}) — marking as invalid for combo retry`
             );
             return { valid: false, reason: "streaming empty stop with no content" };
+          }
+
+          // Mid-thought stop: content reached the wire but ends mid-sentence
+          // (trimmed last char is `:`/`;`/`,` OR trailed by `...`) and the turn
+          // finished with stop/length and NO tool_calls. A complete agent turn
+          // never ends with a bare colon, comma, or ellipsis; the model was cut
+          // off. Flag invalid so the combo skips+failovers to the next key
+          // (DeepSeek returns a complete answer) instead of the stream-layer
+          // MIDTHOUGHT synth emitting a `true` keep-alive that pollutes the
+          // context. The comma must be included to stay aligned with the synth
+          // layer's own mid-thought regex (`[:;,]$|\.\.\.$`).
+          if (
+            openAIContentText.length > 0 &&
+            openAIContentText.trim().length > 0 &&
+            !openAIToolCallsFound &&
+            hasOpenAIStopOrToolCalls &&
+            /[;:,]$|\.\.\.$/.test(openAIContentText.trim())
+          ) {
+            const tail = openAIContentText.trim().slice(-12);
+            log.warn?.(
+              "COMBO",
+              `Streaming OpenAI-style response ended mid-thought (finish with no tool_calls, last chars=${JSON.stringify(tail)}) — marking as invalid for combo retry`
+            );
+            return { valid: false, reason: "streaming mid-thought stop" };
           }
 
           // Stream ended with a truly EMPTY body (e.g. Gemini returning HTTP

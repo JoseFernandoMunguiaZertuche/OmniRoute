@@ -770,6 +770,95 @@ export function isParamValidation400(errorText) {
   );
 }
 
+/**
+ * Strip `{"command":"true"}` bash noop tool calls (and their matching tool
+ * results) from the conversation history. These accumulate from the
+ * stream-layer synth (patch_synth_bash_noop) and condition GLM 5.2 to emit
+ * them itself (model-level mimicry) — polluting the context and wasting
+ * tokens. Removing the example from what the model sees breaks the mimic
+ * loop without changing the logical conversation (a literal `true` is a noop).
+ * Surgical: only drops assistant turns that contain ONLY true-noops with no
+ * text content (and the matching tool results), so mixed turns and genuine
+ * tool calls are preserved.
+ */
+function stripTrueNoopToolCalls<T extends { messages?: unknown }>(body: T): T {
+  const messages = (body as { messages?: unknown }).messages;
+  if (!Array.isArray(messages)) return body;
+  const trueCallIds = new Set<string>();
+  // Pass 1: collect tool_call ids of assistant turns that contain ONLY true noops
+  // (no text content) — the only case we drop wholesale.
+  for (const m of messages) {
+    if (!m || typeof m !== "object") continue;
+    const r = m as { role?: string; content?: unknown; tool_calls?: unknown[] };
+    if (r.role !== "assistant") continue;
+    const tcs = r.tool_calls;
+    if (!Array.isArray(tcs) || tcs.length === 0) continue;
+    const content = r.content;
+    if (typeof content === "string" && content.length > 0) continue; // has text — keep
+    let allTrue = true;
+    for (const tc of tcs) {
+      if (!tc || typeof tc !== "object") {
+        allTrue = false;
+        break;
+      }
+      const f = (tc as { function?: { name?: string; arguments?: string } }).function;
+      if (!f || f.name !== "bash") {
+        allTrue = false;
+        break;
+      }
+      const args = f.arguments;
+      if (typeof args !== "string") {
+        allTrue = false;
+        break;
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(args);
+      } catch {
+        allTrue = false;
+        break;
+      }
+      if (
+        !parsed ||
+        typeof parsed !== "object" ||
+        (parsed as { command?: unknown }).command !== "true"
+      ) {
+        allTrue = false;
+        break;
+      }
+    }
+    if (allTrue) {
+      for (const tc of tcs) {
+        const id = (tc as { id?: string }).id;
+        if (typeof id === "string") trueCallIds.add(id);
+      }
+    }
+  }
+  if (trueCallIds.size === 0) return body;
+  // Pass 2: drop matching tool results and the all-true assistant turns.
+  const filtered = messages.filter((m) => {
+    if (!m || typeof m !== "object") return true;
+    const r = m as { role?: string; tool_calls?: unknown[]; tool_call_id?: string };
+    if (r.role === "tool") {
+      const tcid = r.tool_call_id;
+      return !(typeof tcid === "string" && trueCallIds.has(tcid));
+    }
+    if (r.role === "assistant") {
+      const tcs = r.tool_calls;
+      if (!Array.isArray(tcs) || tcs.length === 0) return true;
+      return !tcs.every(
+        (tc) =>
+          tc &&
+          typeof tc === "object" &&
+          typeof (tc as { id?: string }).id === "string" &&
+          trueCallIds.has((tc as { id?: string }).id as string)
+      );
+    }
+    return true;
+  });
+  return { ...body, messages: filtered } as T;
+}
+
 /** @param {object} options */
 export async function handleComboChat({
   body,
@@ -798,6 +887,10 @@ export async function handleComboChat({
     reasoningTokenBufferEnabled,
   } = phaseComboSetup(comboCtx);
   body = comboCtx.body;
+  // Sanitize: strip {"command":"true"} bash noops from history before any
+  // upstream attempt (all targets/retries see the cleaned body). See
+  // stripTrueNoopToolCalls for rationale (model-level mimicry of the synth).
+  body = stripTrueNoopToolCalls(body);
 
   const handleSingleModelWithTimeout = buildTargetTimeoutRunner({
     handleSingleModel,
@@ -1836,22 +1929,20 @@ export async function handleComboChat({
               break;
             }
 
-            // Empty response — record and retry if budget remains.
+            // Empty response — fall over to the next combo target immediately.
+            // User preference 2026-08-02: do NOT retry the same target (the
+            // empty/empty-reasoning stop is model-level, so same-input retries
+            // and backoff just waste time before failover). Skip straight to
+            // the next key and let the post-loop quality check reject this
+            // response (which records failure and breaks to the next model).
             emptyRetryCount = emptyAttempt + 1;
             emptyReason = quickReason;
             log.warn(
               "COMBO",
-              `Empty-response retry ${emptyRetryCount}/${EMPTY_RESPONSE_MAX_RETRIES} on ${modelStr} (${target.connectionId?.slice(0, 8) || "?"}) — reason=${quickReason}`
+              `Empty response from ${modelStr} (${target.connectionId?.slice(0, 8) || "?"}) — reason=${quickReason}; skipping retries, falling over to next key`
             );
-            if (emptyAttempt >= EMPTY_RESPONSE_MAX_RETRIES) {
-              // Out of retries — return the last response so the existing
-              // quality-rejected path runs (records failure, falls through).
-              result = attemptResult;
-              break;
-            }
-            // Exponential backoff before retry: 500ms, 1s, 2s (capped).
-            const backoffMs = Math.min(2000, 500 * Math.pow(2, emptyAttempt));
-            await new Promise((r) => setTimeout(r, backoffMs));
+            result = attemptResult;
+            break;
           }
 
           // Success — validate response quality before returning
@@ -3044,17 +3135,18 @@ async function handleRoundRobinCombo({
             break;
           }
 
+          // Empty response — fall over to the next RR target immediately.
+          // User preference 2026-08-02: do NOT retry the same target (the
+          // empty/empty-reasoning stop is model-level, so same-input retries
+          // and backoff just waste time before failover). Skip straight to the
+          // next key and let the post-loop quality check reject this response.
           rrEmptyRetryCount = emptyAttempt + 1;
           log.warn(
             "COMBO-RR",
-            `Empty-response retry ${rrEmptyRetryCount}/${EMPTY_RESPONSE_MAX_RETRIES} on ${modelStr} (${target.connectionId?.slice(0, 8) || "?"}) — reason=${quickReason}`
+            `Empty response from ${modelStr} (${target.connectionId?.slice(0, 8) || "?"}) — reason=${quickReason}; skipping retries, falling over to next key`
           );
-          if (emptyAttempt >= EMPTY_RESPONSE_MAX_RETRIES) {
-            result = attemptResult;
-            break;
-          }
-          const backoffMs = Math.min(2000, 500 * Math.pow(2, emptyAttempt));
-          await new Promise((r) => setTimeout(r, backoffMs));
+          result = attemptResult;
+          break;
         }
 
         // Success — validate response quality before returning

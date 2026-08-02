@@ -1870,7 +1870,15 @@ export function createSSEStream(options: StreamOptions = {}) {
                   // a no-op tool_call regardless of reasoning presence forces the loop to
                   // continue: opencode runs `bash true`, observes empty output, and
                   // sends another turn.
+                  //
+                  // DISABLED 2026-08-02: the `{"command":"true"}` keep-alive tool call
+                  // polluted agent context (720+ trues in one session, plus model
+                  // mimicry). The combo layer now handles empty/mid-thought stops by
+                  // peeking the raw stream to end-of-stream and failing over to the
+                  // next combo key (DeepSeek returns a complete answer). For non-combo
+                  // streams the turn simply ends without a synthetic tool call.
                   if (
+                    false &&
                     isFinishChunk &&
                     parsed.choices[0]?.finish_reason === "stop" &&
                     !passthroughHasToolCalls &&
@@ -1941,7 +1949,14 @@ export function createSSEStream(options: StreamOptions = {}) {
                   // instead of `tool_calls`. The EMPTY `!passthroughAccumulatedContent.trim()`
                   // branch above did NOT fire because `passthroughAccumulatedContent` was
                   // non-empty mid-thought text.
+                  //
+                  // DISABLED 2026-08-02: see the EMPTY-branch note above. The combo
+                  // layer now catches mid-thought stops via the peek validator
+                  // (`validateResponseQuality` — `streaming mid-thought stop`) and
+                  // fails over to the next combo key instead of polluting context
+                  // with a `{"command":"true"}` keep-alive.
                   else if (
+                    false &&
                     isFinishChunk &&
                     parsed.choices[0]?.finish_reason === "stop" &&
                     !passthroughHasToolCalls &&
